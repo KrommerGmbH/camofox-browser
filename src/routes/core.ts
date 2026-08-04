@@ -12,6 +12,7 @@ import { loadConfig } from '../utils/config';
 import { getAllPresets, resolveContextOptions, validateContextOptions } from '../utils/presets';
 import { contextPool, getDisplayForUser } from '../services/context-pool';
 import { lifecycleController } from '../services/lifecycle-controller';
+import { recordNavSuccess, recordNavFailure, setRecovering } from '../services/health';
 import { startVnc, stopVnc } from '../services/vnc';
 import {
 	MAX_TABS_PER_SESSION,
@@ -114,6 +115,33 @@ const PKG_VERSION = (() => {
 })();
 
 const router = Router();
+
+/**
+ * Record a navigation failure and recover the browser context when the
+ * consecutive failure threshold is exceeded.
+ *
+ * The health module tracks consecutiveNavFailures against CONFIG.failureThreshold.
+ * When the threshold is reached, this function closes the user's browser context
+ * via contextPool.closeContextByUserId() so that the next ensureContext() call
+ * relaunches a fresh browser — providing automatic recovery from stuck/unresponsive
+ * browser processes without requiring a full server restart.
+ *
+ * Safe to call from route catch blocks: best-effort, never throws.
+ */
+async function handleNavFailure(userId: string): Promise<void> {
+	try {
+		if (!userId) return;
+		const exceeded = recordNavFailure();
+		if (!exceeded) return;
+		log('info', 'nav failure threshold exceeded, recovering browser context', { userId });
+		setRecovering(true);
+		await contextPool.closeContextByUserId(userId);
+	} catch {
+		// Best-effort recovery — never propagate
+	} finally {
+		setRecovering(false);
+	}
+}
 
 function getTab(tabId: string, userId: unknown): TabState | undefined {
 	return findTabById(tabId, userId)?.tabState;
@@ -597,6 +625,7 @@ router.post(
 				sessionKey: resolvedSessionKey,
 				url: pageUrl,
 			});
+			recordNavSuccess();
 			lifecycleController.recordInteractiveActivity();
 			releaseSessionProfileCreate?.(true);
 			releaseSessionProfileCreate = undefined;
@@ -624,6 +653,7 @@ router.post(
 			releaseSessionProfileCreate = undefined;
 			const message = err instanceof Error ? err.message : String(err);
 			log('error', 'tab create failed', { reqId: req.reqId, error: message });
+			await handleNavFailure(String(createUserId ?? ''));
 			return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 		}
 	},
@@ -706,12 +736,14 @@ router.post('/tabs/:tabId/navigate', async (req: Request<{ tabId: string }, unkn
 
 		if (result.status !== 200) return res.status(result.status).json(result.body);
 
+		recordNavSuccess();
 		lifecycleController.recordInteractiveActivity();
 		log('info', 'navigated', { reqId: req.reqId, tabId, url: result.body.url });
 		return res.json(result.body);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'navigate failed', { reqId: req.reqId, tabId, error: message });
+		await handleNavFailure(String(req.body.userId ?? ''));
 		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });
