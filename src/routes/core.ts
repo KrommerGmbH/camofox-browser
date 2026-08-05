@@ -12,7 +12,7 @@ import { loadConfig } from '../utils/config';
 import { getAllPresets, resolveContextOptions, validateContextOptions } from '../utils/presets';
 import { contextPool, getDisplayForUser } from '../services/context-pool';
 import { lifecycleController } from '../services/lifecycle-controller';
-import { recordNavSuccess, recordNavFailure, setRecovering } from '../services/health';
+import { recordNavSuccess, recordNavFailure, acquireRecoveryLock, releaseRecoveryLock } from '../services/health';
 import { startVnc, stopVnc } from '../services/vnc';
 import {
 	MAX_TABS_PER_SESSION,
@@ -117,29 +117,39 @@ const PKG_VERSION = (() => {
 const router = Router();
 
 /**
- * Record a navigation failure and recover the browser context when the
- * consecutive failure threshold is exceeded.
+ * Record a navigation failure for a specific user and recover their
+ * browser context when the consecutive failure threshold is exceeded.
  *
- * The health module tracks consecutiveNavFailures against CONFIG.failureThreshold.
- * When the threshold is reached, this function closes the user's browser context
- * via contextPool.closeContextByUserId() so that the next ensureContext() call
- * relaunches a fresh browser — providing automatic recovery from stuck/unresponsive
- * browser processes without requiring a full server restart.
+ * The health module tracks per-user consecutiveNavFailures against
+ * CONFIG.failureThreshold. When the threshold is reached for a user,
+ * this function closes that user's browser context via
+ * contextPool.closeContextByUserId() so the next ensureContext() call
+ * relaunches a fresh browser — providing automatic recovery from
+ * stuck/unresponsive browser processes without affecting other users.
+ *
+ * Single-flight: if a recovery for this user is already in flight,
+ * subsequent failures are recorded but do not trigger a second
+ * recovery. The lock is released and the failure counter is reset
+ * after recovery completes (or fails).
  *
  * Safe to call from route catch blocks: best-effort, never throws.
  */
 async function handleNavFailure(userId: string): Promise<void> {
 	try {
 		if (!userId) return;
-		const exceeded = recordNavFailure();
+		const exceeded = recordNavFailure(userId);
 		if (!exceeded) return;
+		// Single-flight: skip if a recovery for this user is already running.
+		if (!acquireRecoveryLock(userId)) {
+			log('info', 'nav failure threshold exceeded, recovery already in flight', { userId });
+			return;
+		}
 		log('info', 'nav failure threshold exceeded, recovering browser context', { userId });
-		setRecovering(true);
 		await contextPool.closeContextByUserId(userId);
 	} catch {
 		// Best-effort recovery — never propagate
 	} finally {
-		setRecovering(false);
+		releaseRecoveryLock(userId);
 	}
 }
 
@@ -387,6 +397,11 @@ router.post(
 		let releaseSessionProfileCreate: ((committed: boolean) => void) | undefined;
 		let isFirstCreator = false;
 		let stagedGeneration: string | undefined;
+		// Track whether the error (if any) occurred during navigation
+		// vs. provisioning. Only navigation errors should be counted
+		// toward the nav failure threshold — provisioning errors
+		// (session creation, mutex, profile) are a different class.
+		let navError = false;
 		try {
 			if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
 				return res.status(403).json({ error: 'Forbidden' });
@@ -550,11 +565,13 @@ router.post(
 				markDownloadsStaged(tabId);
 
 				if (url) {
+					navError = true;
 					await navigateWithSafetyGuard(page, url, {
 						allowPrivateNetworkTargets: CONFIG.allowPrivateNetworkTargets,
 						waitUntil: 'domcontentloaded',
 						timeout: 30000,
 					});
+					navError = false;
 					tabState.visitedUrls.add(url);
 				}
 
@@ -607,11 +624,13 @@ router.post(
 				registerDownloadListener(tabId, String(userId), page);
 
 				if (url) {
+					navError = true;
 					await navigateWithSafetyGuard(page, url, {
 						allowPrivateNetworkTargets: CONFIG.allowPrivateNetworkTargets,
 						waitUntil: 'domcontentloaded',
 						timeout: 30000,
 					});
+					navError = false;
 					tabState.visitedUrls.add(url);
 				}
 
@@ -619,13 +638,13 @@ router.post(
 			}
 
 			log('info', 'tab created', {
-				reqId: req.reqId,
-				tabId,
-				userId,
-				sessionKey: resolvedSessionKey,
-				url: pageUrl,
+			reqId: req.reqId,
+			tabId,
+			userId,
+			sessionKey: resolvedSessionKey,
+			url: pageUrl,
 			});
-			recordNavSuccess();
+			recordNavSuccess(String(userId));
 			lifecycleController.recordInteractiveActivity();
 			releaseSessionProfileCreate?.(true);
 			releaseSessionProfileCreate = undefined;
@@ -653,7 +672,12 @@ router.post(
 			releaseSessionProfileCreate = undefined;
 			const message = err instanceof Error ? err.message : String(err);
 			log('error', 'tab create failed', { reqId: req.reqId, error: message });
-			await handleNavFailure(String(createUserId ?? ''));
+			// Only count navigation errors toward the failure threshold —
+			// provisioning errors (session creation, mutex, profile) are
+			// a different class and should not trigger browser recovery.
+			if (navError) {
+				await handleNavFailure(String(createUserId ?? ''));
+			}
 			return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 		}
 	},
@@ -736,7 +760,7 @@ router.post('/tabs/:tabId/navigate', async (req: Request<{ tabId: string }, unkn
 
 		if (result.status !== 200) return res.status(result.status).json(result.body);
 
-		recordNavSuccess();
+		recordNavSuccess(String(req.body.userId));
 		lifecycleController.recordInteractiveActivity();
 		log('info', 'navigated', { reqId: req.reqId, tabId, url: result.body.url });
 		return res.json(result.body);
