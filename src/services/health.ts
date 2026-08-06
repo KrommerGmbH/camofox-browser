@@ -149,6 +149,15 @@ export function resetHealth(): void {
 	healthState.activeOps = 0;
 }
 
+/**
+ * Evicts a user's health entry from the map. Called after recovery
+ * completes to prevent the map from growing unbounded over the
+ * process lifetime. Safe to call even if the user has no entry.
+ */
+export function deleteUserHealth(userId: string): void {
+	userHealthMap.delete(userId);
+}
+
 // ── Test-only exports ──────────────────────────────────────────────
 // These allow unit tests to inspect and manipulate the per-user health
 // map without relying on the process-global aggregate. Not part of the

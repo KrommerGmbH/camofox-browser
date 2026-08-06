@@ -35,6 +35,7 @@ const {
   isUserRecovering,
   getHealthState,
   resetHealth,
+  deleteUserHealth,
   __getUserHealthForTests,
   __clearUserHealthForTests,
 } = require('../../dist/src/services/health');
@@ -213,7 +214,38 @@ describe('Per-user nav health tracking and auto-recovery', () => {
     });
   });
 
-  // ── 5. Aggregate health state ─────────────────────────────────
+  // ── 5. Health map eviction ─────────────────────────────────────
+  // The map should not grow unbounded — deleteUserHealth evicts
+  // entries after recovery completes.
+
+  describe('health map eviction', () => {
+    test('deleteUserHealth removes a user entry', () => {
+      recordNavFailure('user-a');
+      expect(__getUserHealthForTests('user-a')).toBeDefined();
+
+      deleteUserHealth('user-a');
+      expect(__getUserHealthForTests('user-a')).toBeUndefined();
+    });
+
+    test('deleteUserHealth is safe for non-existent user', () => {
+      expect(() => deleteUserHealth('never-existed')).not.toThrow();
+    });
+
+    test('user can re-accumulate after eviction', () => {
+      recordNavFailure('user-a');
+      recordNavFailure('user-a');
+      recordNavFailure('user-a'); // threshold
+
+      deleteUserHealth('user-a');
+
+      // Fresh start — needs 3 more failures
+      expect(recordNavFailure('user-a')).toBe(false);
+      expect(recordNavFailure('user-a')).toBe(false);
+      expect(recordNavFailure('user-a')).toBe(true);
+    });
+  });
+
+  // ── 6. Aggregate health state ─────────────────────────────────
 
   describe('aggregate health state', () => {
     test('getHealthState aggregates per-user counters', () => {
@@ -237,7 +269,7 @@ describe('Per-user nav health tracking and auto-recovery', () => {
     });
   });
 
-  // ── 6. OpenClaw path parity ───────────────────────────────────
+  // ── 7. OpenClaw path parity ───────────────────────────────────
   //
   // The OpenClaw route uses the same health module API as core.ts.
   // This test verifies that the health module treats OpenClaw-origin

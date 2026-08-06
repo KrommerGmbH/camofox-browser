@@ -17,7 +17,8 @@ import { loadConfig } from '../utils/config';
 import { closeBrowser } from '../services/browser';
 import { contextPool } from '../services/context-pool';
 import { lifecycleController } from '../services/lifecycle-controller';
-import { recordNavSuccess, recordNavFailure, acquireRecoveryLock, releaseRecoveryLock } from '../services/health';
+import { recordNavSuccess } from '../services/health';
+import { handleNavFailure } from '../services/nav-recovery';
 import { registerDownloadListener } from '../services/download';
 import {
 	MAX_TABS_PER_SESSION,
@@ -82,35 +83,6 @@ function getRouteErrorStatus(err: unknown): number {
 	}
 	return 500;
 }
-
-/**
- * Record a navigation failure for a specific user and recover their
- * browser context when the consecutive failure threshold is exceeded.
- *
- * Per-user: only the failing user's context is closed. Single-flight:
- * if a recovery for this user is already in flight, subsequent failures
- * are recorded but do not trigger a second recovery.
- *
- * Safe to call from route catch blocks: best-effort, never throws.
- */
-async function handleNavFailure(userId: string): Promise<void> {
-	try {
-		if (!userId) return;
-		const exceeded = recordNavFailure(userId);
-		if (!exceeded) return;
-		if (!acquireRecoveryLock(userId)) {
-			log('info', 'nav failure threshold exceeded, recovery already in flight', { userId });
-			return;
-		}
-		log('info', 'nav failure threshold exceeded, recovering browser context', { userId });
-		await contextPool.closeContextByUserId(userId);
-	} catch {
-		// Best-effort recovery — never propagate
-	} finally {
-		releaseRecoveryLock(userId);
-	}
-}
-
 
 type LoadStateLike = 'load' | 'domcontentloaded' | 'networkidle';
 

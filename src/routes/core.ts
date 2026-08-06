@@ -12,7 +12,8 @@ import { loadConfig } from '../utils/config';
 import { getAllPresets, resolveContextOptions, validateContextOptions } from '../utils/presets';
 import { contextPool, getDisplayForUser } from '../services/context-pool';
 import { lifecycleController } from '../services/lifecycle-controller';
-import { recordNavSuccess, recordNavFailure, acquireRecoveryLock, releaseRecoveryLock } from '../services/health';
+import { recordNavSuccess } from '../services/health';
+import { handleNavFailure } from '../services/nav-recovery';
 import { startVnc, stopVnc } from '../services/vnc';
 import {
 	MAX_TABS_PER_SESSION,
@@ -115,43 +116,6 @@ const PKG_VERSION = (() => {
 })();
 
 const router = Router();
-
-/**
- * Record a navigation failure for a specific user and recover their
- * browser context when the consecutive failure threshold is exceeded.
- *
- * The health module tracks per-user consecutiveNavFailures against
- * CONFIG.failureThreshold. When the threshold is reached for a user,
- * this function closes that user's browser context via
- * contextPool.closeContextByUserId() so the next ensureContext() call
- * relaunches a fresh browser — providing automatic recovery from
- * stuck/unresponsive browser processes without affecting other users.
- *
- * Single-flight: if a recovery for this user is already in flight,
- * subsequent failures are recorded but do not trigger a second
- * recovery. The lock is released and the failure counter is reset
- * after recovery completes (or fails).
- *
- * Safe to call from route catch blocks: best-effort, never throws.
- */
-async function handleNavFailure(userId: string): Promise<void> {
-	try {
-		if (!userId) return;
-		const exceeded = recordNavFailure(userId);
-		if (!exceeded) return;
-		// Single-flight: skip if a recovery for this user is already running.
-		if (!acquireRecoveryLock(userId)) {
-			log('info', 'nav failure threshold exceeded, recovery already in flight', { userId });
-			return;
-		}
-		log('info', 'nav failure threshold exceeded, recovering browser context', { userId });
-		await contextPool.closeContextByUserId(userId);
-	} catch {
-		// Best-effort recovery — never propagate
-	} finally {
-		releaseRecoveryLock(userId);
-	}
-}
 
 function getTab(tabId: string, userId: unknown): TabState | undefined {
 	return findTabById(tabId, userId)?.tabState;
