@@ -3,12 +3,18 @@ import { recordNavFailure, acquireRecoveryLock, releaseRecoveryLock, deleteUserH
 import { contextPool } from './context-pool';
 
 /**
- * Record a navigation failure for a specific user and recover their
- * browser context when the consecutive failure threshold is exceeded.
+ * Record a navigation failure for a specific user/session and recover
+ * their browser context when the consecutive failure threshold is exceeded.
  *
- * Per-user: only the failing user's context is closed. Single-flight:
- * if a recovery for this user is already in flight, subsequent
- * failures are recorded but do not trigger a second recovery.
+ * Session-scoped: recovery targets the specific session/profile that had
+ * the navigation failure, so one failing tab never terminates unrelated
+ * sessions for the same user. When `sessionMapKey` is unavailable, falls
+ * back to closing all of the user's contexts (backward compatible).
+ *
+ * Per-user: health accounting and the single-flight lock remain keyed by
+ * userId (independent failure counters per user). Single-flight: if a
+ * recovery for this user is already in flight, subsequent failures are
+ * recorded but do not trigger a second recovery.
  *
  * Lock ownership: `releaseRecoveryLock` and `deleteUserHealth` are
  * called **only** by the invocation that acquired the lock. This
@@ -17,7 +23,7 @@ import { contextPool } from './context-pool';
  *
  * Safe to call from route catch blocks: best-effort, never throws.
  */
-export async function handleNavFailure(userId: string): Promise<void> {
+export async function handleNavFailure(userId: string, sessionMapKey?: string): Promise<void> {
 	let lockAcquired = false;
 	try {
 		if (!userId) return;
@@ -29,8 +35,11 @@ export async function handleNavFailure(userId: string): Promise<void> {
 			return;
 		}
 		lockAcquired = true;
-		log('info', 'nav failure threshold exceeded, recovering browser context', { userId });
-		await contextPool.closeContextByUserId(userId);
+		log('info', 'nav failure threshold exceeded, recovering browser context', {
+			userId,
+			sessionMapKey: sessionMapKey ?? null,
+		});
+		await contextPool.closeContextBySession(userId, sessionMapKey);
 	} catch {
 		// Best-effort recovery — never propagate
 	} finally {

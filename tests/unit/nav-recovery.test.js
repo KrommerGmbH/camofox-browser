@@ -2,25 +2,29 @@
  * Route-level tests for handleNavFailure in nav-recovery.ts.
  *
  * These tests exercise the actual handleNavFailure function (not just
- * the health module) with mocked contextPool.closeContextByUserId.
+ * the health module) with mocked contextPool.closeContextBySession.
  * They verify the lock-ownership fix and the four scenarios the
  * maintainer requested:
  *
  * 1. Below-threshold failures accumulate (counter not reset by finally)
- * 2. Threshold-triggered close counts (closeContextByUserId called once)
+ * 2. Threshold-triggered close counts (closeContextBySession called once)
  * 3. Concurrent non-owner behavior (non-owner does not clear another's lock)
  * 4. Recovery failure cleanup (lock released + health evicted on failure)
+ *
+ * Additional tests for session-scoped recovery (PR #27 round 2):
+ * 5. sessionMapKey passed through to closeContextBySession
+ * 6. No sessionMapKey falls back to user-wide close (backward compat)
  *
  * No running server or browser is required — contextPool is mocked.
  */
 
 // ── Mocks ───────────────────────────────────────────────────────────
 
-const mockCloseContextByUserId = jest.fn();
+const mockCloseContextBySession = jest.fn();
 
 jest.mock('../../dist/src/services/context-pool', () => ({
   contextPool: {
-    closeContextByUserId: mockCloseContextByUserId,
+    closeContextBySession: mockCloseContextBySession,
   },
 }));
 
@@ -78,20 +82,20 @@ describe('handleNavFailure — route-level lock ownership', () => {
       expect(__getUserHealthForTests('user-a').consecutiveNavFailures).toBe(2);
 
       // closeContextByUserId should NOT have been called
-      expect(mockCloseContextByUserId).not.toHaveBeenCalled();
+      expect(mockCloseContextBySession).not.toHaveBeenCalled();
     });
 
     test('third failure reaches threshold and triggers recovery', async () => {
       // Two below-threshold failures
       await handleNavFailure('user-a');
       await handleNavFailure('user-a');
-      expect(mockCloseContextByUserId).not.toHaveBeenCalled();
+      expect(mockCloseContextBySession).not.toHaveBeenCalled();
 
       // Third failure — threshold reached
-      mockCloseContextByUserId.mockResolvedValue(undefined);
+      mockCloseContextBySession.mockResolvedValue(undefined);
       await handleNavFailure('user-a');
-      expect(mockCloseContextByUserId).toHaveBeenCalledTimes(1);
-      expect(mockCloseContextByUserId).toHaveBeenCalledWith('user-a');
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
+      expect(mockCloseContextBySession).toHaveBeenCalledWith('user-a', undefined);
     });
 
     test('success between failures resets counter (normal operation)', async () => {
@@ -106,7 +110,7 @@ describe('handleNavFailure — route-level lock ownership', () => {
       // Two more failures should not trigger recovery
       await handleNavFailure('user-a');
       await handleNavFailure('user-a');
-      expect(mockCloseContextByUserId).not.toHaveBeenCalled();
+      expect(mockCloseContextBySession).not.toHaveBeenCalled();
     });
   });
 
@@ -114,54 +118,54 @@ describe('handleNavFailure — route-level lock ownership', () => {
 
   describe('threshold-triggered close counts', () => {
     test('closeContextByUserId called exactly once at threshold', async () => {
-      mockCloseContextByUserId.mockResolvedValue(undefined);
+      mockCloseContextBySession.mockResolvedValue(undefined);
 
       for (let i = 0; i < 3; i++) {
         await handleNavFailure('user-a');
       }
 
-      expect(mockCloseContextByUserId).toHaveBeenCalledTimes(1);
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
     });
 
     test('recovery resets counter, next batch starts fresh', async () => {
-      mockCloseContextByUserId.mockResolvedValue(undefined);
+      mockCloseContextBySession.mockResolvedValue(undefined);
 
       // First cycle: 3 failures → recovery
       for (let i = 0; i < 3; i++) {
         await handleNavFailure('user-a');
       }
-      expect(mockCloseContextByUserId).toHaveBeenCalledTimes(1);
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
 
       // After recovery, the user's health entry is evicted.
       // Two more failures should NOT trigger recovery (need 3 again).
       await handleNavFailure('user-a');
       await handleNavFailure('user-a');
-      expect(mockCloseContextByUserId).toHaveBeenCalledTimes(1);
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
 
       // Third failure triggers recovery again
       await handleNavFailure('user-a');
-      expect(mockCloseContextByUserId).toHaveBeenCalledTimes(2);
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(2);
     });
 
     test('different users have independent thresholds', async () => {
-      mockCloseContextByUserId.mockResolvedValue(undefined);
+      mockCloseContextBySession.mockResolvedValue(undefined);
 
       // 3 failures for user-a → recovery
       for (let i = 0; i < 3; i++) {
         await handleNavFailure('user-a');
       }
-      expect(mockCloseContextByUserId).toHaveBeenCalledTimes(1);
-      expect(mockCloseContextByUserId).toHaveBeenLastCalledWith('user-a');
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
+      expect(mockCloseContextBySession).toHaveBeenLastCalledWith('user-a', undefined);
 
       // 2 failures for user-b → no recovery yet
       await handleNavFailure('user-b');
       await handleNavFailure('user-b');
-      expect(mockCloseContextByUserId).toHaveBeenCalledTimes(1);
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
 
       // 3rd failure for user-b → recovery
       await handleNavFailure('user-b');
-      expect(mockCloseContextByUserId).toHaveBeenCalledTimes(2);
-      expect(mockCloseContextByUserId).toHaveBeenLastCalledWith('user-b');
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(2);
+      expect(mockCloseContextBySession).toHaveBeenLastCalledWith('user-b', undefined);
     });
   });
 
@@ -185,11 +189,11 @@ describe('handleNavFailure — route-level lock ownership', () => {
       // recordNavFailure will increment to 3 (threshold exceeded),
       // but acquireRecoveryLock will return false (A has it).
       // B's finally must NOT call releaseRecoveryLock.
-      mockCloseContextByUserId.mockResolvedValue(undefined);
+      mockCloseContextBySession.mockResolvedValue(undefined);
       await handleNavFailure('user-a');
 
       // closeContextByUserId should NOT be called by B
-      expect(mockCloseContextByUserId).not.toHaveBeenCalled();
+      expect(mockCloseContextBySession).not.toHaveBeenCalled();
 
       // A's lock should still be held
       expect(isUserRecovering('user-a')).toBe(true);
@@ -204,7 +208,7 @@ describe('handleNavFailure — route-level lock ownership', () => {
     });
 
     test('concurrent failures from different users do not interfere', async () => {
-      mockCloseContextByUserId.mockResolvedValue(undefined);
+      mockCloseContextBySession.mockResolvedValue(undefined);
 
       // Interleave failures: a, b, a, b, a
       // A should trigger on its 3rd call; B should not trigger
@@ -216,15 +220,15 @@ describe('handleNavFailure — route-level lock ownership', () => {
       // A's 3rd failure — triggers recovery for A only
       await handleNavFailure('a'); // a=3 → threshold
 
-      expect(mockCloseContextByUserId).toHaveBeenCalledTimes(1);
-      expect(mockCloseContextByUserId).toHaveBeenCalledWith('a');
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
+      expect(mockCloseContextBySession).toHaveBeenCalledWith('a', undefined);
 
       // B is at 2, no recovery
       expect(__getUserHealthForTests('b').consecutiveNavFailures).toBe(2);
     });
     test('empty userId is a no-op (does not create health entry)', async () => {
       await handleNavFailure('');
-      expect(mockCloseContextByUserId).not.toHaveBeenCalled();
+      expect(mockCloseContextBySession).not.toHaveBeenCalled();
       expect(__getUserHealthForTests('')).toBeUndefined();
     });
   });
@@ -233,7 +237,7 @@ describe('handleNavFailure — route-level lock ownership', () => {
 
   describe('recovery failure cleanup', () => {
     test('lock released and health evicted when closeContextByUserId throws', async () => {
-      mockCloseContextByUserId.mockRejectedValue(new Error('close failed'));
+      mockCloseContextBySession.mockRejectedValue(new Error('close failed'));
 
       // 3 failures → threshold → recovery fails
       await handleNavFailure('user-a');
@@ -241,7 +245,7 @@ describe('handleNavFailure — route-level lock ownership', () => {
       await handleNavFailure('user-a');
 
       // Recovery was attempted (closeContextByUserId called)
-      expect(mockCloseContextByUserId).toHaveBeenCalledTimes(1);
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
 
       // Lock should be released (not stuck in recovering state)
       expect(isUserRecovering('user-a')).toBe(false);
@@ -252,21 +256,21 @@ describe('handleNavFailure — route-level lock ownership', () => {
       // User can trigger recovery again with fresh failures
       await handleNavFailure('user-a');
       await handleNavFailure('user-a');
-      expect(mockCloseContextByUserId).toHaveBeenCalledTimes(1);
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
 
-      mockCloseContextByUserId.mockResolvedValue(undefined);
+      mockCloseContextBySession.mockResolvedValue(undefined);
       await handleNavFailure('user-a');
-      expect(mockCloseContextByUserId).toHaveBeenCalledTimes(2);
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(2);
     });
 
     test('successful recovery evicts health entry', async () => {
-      mockCloseContextByUserId.mockResolvedValue(undefined);
+      mockCloseContextBySession.mockResolvedValue(undefined);
 
       for (let i = 0; i < 3; i++) {
         await handleNavFailure('user-a');
       }
 
-      expect(mockCloseContextByUserId).toHaveBeenCalledTimes(1);
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
       // After successful recovery, health entry is evicted
       expect(__getUserHealthForTests('user-a')).toBeUndefined();
     });
@@ -280,12 +284,55 @@ describe('handleNavFailure — route-level lock ownership', () => {
       await handleNavFailure('user-a');
       await handleNavFailure('user-a');
 
-      expect(mockCloseContextByUserId).not.toHaveBeenCalled();
+      expect(mockCloseContextBySession).not.toHaveBeenCalled();
       // Lock should still be held by the original acquirer
       expect(isUserRecovering('user-a')).toBe(true);
 
       // Clean up
       releaseRecoveryLock('user-a');
+    });
+  });
+
+  // ── 5. Session-scoped recovery ──────────────────────────────
+
+  describe('session-scoped recovery (PR #27 round 2)', () => {
+    test('sessionMapKey is passed through to closeContextBySession', async () => {
+      mockCloseContextBySession.mockResolvedValue(undefined);
+
+      for (let i = 0; i < 3; i++) {
+        await handleNavFailure('user-a', 'session-key-1');
+      }
+
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
+      expect(mockCloseContextBySession).toHaveBeenCalledWith('user-a', 'session-key-1');
+    });
+
+    test('session key is forwarded for targeted close, health stays per-user', async () => {
+      mockCloseContextBySession.mockResolvedValue(undefined);
+
+      // Health counters are per-user (not per-session). Three failures
+      // from the same user with different session keys still accumulate
+      // on the same user's counter. The session key is only used to
+      // target which context gets closed (blast radius reduction).
+      await handleNavFailure('user-a', 'session-1');
+      await handleNavFailure('user-a', 'session-2');
+      // Third failure hits threshold — recovery closes session-1 specifically
+      await handleNavFailure('user-a', 'session-1');
+
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
+      expect(mockCloseContextBySession).toHaveBeenLastCalledWith('user-a', 'session-1');
+    });
+
+    test('no sessionMapKey falls back to user-wide close (backward compat)', async () => {
+      mockCloseContextBySession.mockResolvedValue(undefined);
+
+      for (let i = 0; i < 3; i++) {
+        await handleNavFailure('user-a');
+      }
+
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
+      // Second arg is undefined — closeContextBySession falls back to user-wide
+      expect(mockCloseContextBySession).toHaveBeenCalledWith('user-a', undefined);
     });
   });
 });

@@ -15,6 +15,7 @@ import { firefox, type BrowserContext, type BrowserContextOptions } from 'playwr
 import { loadConfig } from '../utils/config';
 import { readVersionedSidecar, writeVersionedSidecar } from '../utils/sidecar-version';
 import { log } from '../middleware/logging';
+import { deleteUserHealth } from './health';
 import type { ResolvedProxyConfig } from '../types';
 
 const CONFIG = loadConfig();
@@ -604,9 +605,58 @@ export class ContextPool {
 			if (currentEntry === entry) {
 				this.pool.delete(normalized);
 				log('info', 'persistent context removed from pool', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
+				// A user's browser context was torn down — evict their nav-health
+				// entry so a fresh context starts with a clean failure counter.
+				// (Ordinary context closes would otherwise leave stale health state
+				// in the map for the process lifetime.)
+				deleteUserHealth(entry.userId);
 			} else {
 				log('info', 'persistent context closed but newer entry exists', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
 			}
+		}
+	}
+
+	/**
+	 * Close the context backing a specific session/profile for a user, but
+	 * only that one — never unrelated sessions belonging to the same user.
+	 *
+	 * This is the blast-radius fix for nav recovery: a single failing tab's
+	 * session is torn down without terminating the user's other sessions.
+	 * The `profileKey` is the pool key (which is the sessionMapKey for
+	 * established session profiles). When no exact profile key is available
+	 * or no entry matches, falls back to the user-wide close for backward
+	 * compatibility.
+	 */
+	async closeContextBySession(userId: string, profileKey?: string): Promise<void> {
+		const normalizedUser = String(userId);
+		if (profileKey !== undefined && profileKey !== null && profileKey !== '') {
+			const normalizedProfile = String(profileKey);
+			const entry = this.pool.get(normalizedProfile);
+			// Only close if the key maps to a real context owned by this user.
+			// A stale/foreign key must never terminate a different user's session.
+			if (entry && entry.userId === normalizedUser && !entry.staged) {
+				await this.closeContext(normalizedProfile);
+				return;
+			}
+		}
+		// Fallback: no usable profile key (or no matching entry) — close all
+		// of the user's contexts, matching the historical user-wide behavior.
+		await this.closeContextByUserId(normalizedUser);
+	}
+
+	/**
+	 * Close all non-staged contexts for a user (user-wide recovery fallback).
+	 */
+	async closeContextByUserId(userId: string): Promise<void> {
+		const normalized = String(userId);
+		const entriesToClose: string[] = [];
+		for (const [profileKey, entry] of this.pool.entries()) {
+			if (entry.userId === normalized && !entry.staged) {
+				entriesToClose.push(profileKey);
+			}
+		}
+		for (const profileKey of entriesToClose) {
+			await this.closeContext(profileKey);
 		}
 	}
 
@@ -632,20 +682,6 @@ export class ContextPool {
 		entry.staged = false;
 		entry.stagedGeneration = undefined;
 		await this.closeContext(normalized);
-	}
-
-	async closeContextByUserId(userId: string): Promise<void> {
-		const normalized = String(userId);
-		// Close all contexts for this userId
-		const entriesToClose: string[] = [];
-		for (const [profileKey, entry] of this.pool.entries()) {
-			if (entry.userId === normalized && !entry.staged) {
-				entriesToClose.push(profileKey);
-			}
-		}
-		for (const profileKey of entriesToClose) {
-			await this.closeContext(profileKey);
-		}
 	}
 
 	async closeStagedContextByUserId(userId: string, generation?: string): Promise<void> {

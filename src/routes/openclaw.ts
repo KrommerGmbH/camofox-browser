@@ -314,6 +314,7 @@ router.post('/stop', async (req: Request, res: Response) => {
 
 // POST /navigate - Navigate (OpenClaw format with targetId in body)
 router.post('/navigate', async (req: Request<unknown, unknown, { targetId?: string; url?: string; macro?: string; query?: string; userId?: unknown }>, res: Response) => {
+	let navError = false;
 	try {
 		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req as unknown as Request, CONFIG.apiKey)) {
 			return res.status(403).json({ error: 'Forbidden' });
@@ -335,6 +336,7 @@ router.post('/navigate', async (req: Request<unknown, unknown, { targetId?: stri
 		const { tabState } = found;
 		tabState.toolCalls++;
 
+		navError = true;
 		const result = await withUserLimit(String(userId), CONFIG.maxConcurrentPerUser, () =>
 			withTimeout(
 				withTabLock(String(targetId), async () => {
@@ -363,6 +365,7 @@ router.post('/navigate', async (req: Request<unknown, unknown, { targetId?: stri
 				'openclaw-navigate',
 			),
 		);
+		navError = false;
 
 		if (result.status !== 200) return res.status(result.status).json(result.body);
 		recordNavSuccess(String(userId));
@@ -371,7 +374,9 @@ router.post('/navigate', async (req: Request<unknown, unknown, { targetId?: stri
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'openclaw navigate failed', { reqId: req.reqId, error: message });
-		await handleNavFailure(String(req.body.userId ?? ''));
+		if (navError) {
+			await handleNavFailure(String(req.body.userId ?? ''));
+		}
 		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });
