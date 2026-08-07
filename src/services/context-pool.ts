@@ -15,7 +15,7 @@ import { firefox, type BrowserContext, type BrowserContextOptions } from 'playwr
 import { loadConfig } from '../utils/config';
 import { readVersionedSidecar, writeVersionedSidecar } from '../utils/sidecar-version';
 import { log } from '../middleware/logging';
-import { deleteUserHealth } from './health';
+
 import type { ResolvedProxyConfig } from '../types';
 
 const CONFIG = loadConfig();
@@ -605,11 +605,6 @@ export class ContextPool {
 			if (currentEntry === entry) {
 				this.pool.delete(normalized);
 				log('info', 'persistent context removed from pool', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
-				// A user's browser context was torn down — evict their nav-health
-				// entry so a fresh context starts with a clean failure counter.
-				// (Ordinary context closes would otherwise leave stale health state
-				// in the map for the process lifetime.)
-				deleteUserHealth(entry.userId);
 			} else {
 				log('info', 'persistent context closed but newer entry exists', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
 			}
@@ -623,9 +618,13 @@ export class ContextPool {
 	 * This is the blast-radius fix for nav recovery: a single failing tab's
 	 * session is torn down without terminating the user's other sessions.
 	 * The `profileKey` is the pool key (which is the sessionMapKey for
-	 * established session profiles). When no exact profile key is available
-	 * or no entry matches, falls back to the user-wide close for backward
-	 * compatibility.
+	 * established session profiles).
+	 *
+	 * Fail-closed semantics: when an explicit `profileKey` is provided but
+	 * does not map to a matching context owned by this user, the call is a
+	 * no-op — it does NOT fall back to user-wide close. A stale route key
+	 * must never close every sibling session. User-wide fallback is reserved
+	 * for genuinely legacy callers that pass no profile key at all.
 	 */
 	async closeContextBySession(userId: string, profileKey?: string): Promise<void> {
 		const normalizedUser = String(userId);
@@ -633,14 +632,16 @@ export class ContextPool {
 			const normalizedProfile = String(profileKey);
 			const entry = this.pool.get(normalizedProfile);
 			// Only close if the key maps to a real context owned by this user.
-			// A stale/foreign key must never terminate a different user's session.
+			// A stale/foreign key must never terminate a different user's session
+			// — fail closed (no-op) rather than escalating to user-wide close.
 			if (entry && entry.userId === normalizedUser && !entry.staged) {
 				await this.closeContext(normalizedProfile);
-				return;
 			}
+			// Stale or unmatched key: log and return without closing anything.
+			return;
 		}
-		// Fallback: no usable profile key (or no matching entry) — close all
-		// of the user's contexts, matching the historical user-wide behavior.
+		// No profile key provided — legacy caller without session identity.
+		// Only in this case do we fall back to user-wide close.
 		await this.closeContextByUserId(normalizedUser);
 	}
 

@@ -338,7 +338,6 @@ router.post('/navigate', async (req: Request<unknown, unknown, { targetId?: stri
 		const { tabState } = found;
 		tabState.toolCalls++;
 
-		navError = true;
 		const result = await withUserLimit(String(userId), CONFIG.maxConcurrentPerUser, () =>
 			withTimeout(
 				withTabLock(String(targetId), async () => {
@@ -354,11 +353,18 @@ router.post('/navigate', async (req: Request<unknown, unknown, { targetId?: stri
 					});
 					if (urlErr) return { status: 400 as const, body: { error: urlErr } };
 
+					// Arm navError only around the actual navigation attempt —
+					// limiter/timeout/lock, macro expansion, validation, and
+					// buildRefs failures are NOT navigation errors and must not
+					// advance the recovery threshold.
+					navError = true;
 					await navigateWithSafetyGuard(tabState.page, targetUrl, {
 						allowPrivateNetworkTargets: CONFIG.allowPrivateNetworkTargets,
 						waitUntil: 'domcontentloaded',
 						timeout: 30000,
 					});
+					navError = false;
+
 					tabState.visitedUrls.add(targetUrl);
 					tabState.refs = await buildRefs(tabState.page);
 					return { status: 200 as const, body: { ok: true, targetId, url: tabState.page.url() } };
@@ -367,7 +373,6 @@ router.post('/navigate', async (req: Request<unknown, unknown, { targetId?: stri
 				'openclaw-navigate',
 			),
 		);
-		navError = false;
 
 		if (result.status !== 200) return res.status(result.status).json(result.body);
 		recordNavSuccess(String(userId));
