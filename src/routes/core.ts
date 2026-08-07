@@ -684,6 +684,7 @@ router.get('/tabs', async (req: Request<unknown, unknown, unknown, { userId?: un
 router.post('/tabs/:tabId/navigate', async (req: Request<{ tabId: string }, unknown, { userId?: unknown; url?: string; macro?: string; query?: string }>, res: Response) => {
 	const tabId = req.params.tabId;
 	let navError = false;
+	let foundSessionKey: string | undefined;
 	try {
 		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
 			return res.status(403).json({ error: 'Forbidden' });
@@ -693,6 +694,7 @@ router.post('/tabs/:tabId/navigate', async (req: Request<{ tabId: string }, unkn
 		if (!userId) return res.status(400).json({ error: 'userId required' });
 		const found = findTabById(tabId, userId);
 		if (!found) return res.status(404).json({ error: 'Tab not found' });
+		foundSessionKey = found.sessionKey;
 
 		const { tabState } = found;
 		tabState.toolCalls++;
@@ -738,7 +740,7 @@ router.post('/tabs/:tabId/navigate', async (req: Request<{ tabId: string }, unkn
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'navigate failed', { reqId: req.reqId, tabId, error: message });
 		if (navError) {
-			await handleNavFailure(String(req.body.userId ?? ''));
+			await handleNavFailure(String(req.body.userId ?? ''), foundSessionKey);
 		}
 		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
