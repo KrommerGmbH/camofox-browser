@@ -364,6 +364,10 @@ router.post('/navigate', async (req: Request<unknown, unknown, { targetId?: stri
 						timeout: 30000,
 					});
 					navError = false;
+					// Record success immediately after navigation resolves —
+					// a buildRefs failure after this must NOT prevent the
+					// counter reset, since the navigation itself succeeded.
+					recordNavSuccess(String(userId), foundSessionKey);
 
 					tabState.visitedUrls.add(targetUrl);
 					tabState.refs = await buildRefs(tabState.page);
@@ -375,7 +379,6 @@ router.post('/navigate', async (req: Request<unknown, unknown, { targetId?: stri
 		);
 
 		if (result.status !== 200) return res.status(result.status).json(result.body);
-		recordNavSuccess(String(userId));
 		lifecycleController.recordInteractiveActivity();
 		return res.json(result.body);
 	} catch (err) {

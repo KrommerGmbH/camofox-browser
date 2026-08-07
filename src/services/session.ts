@@ -86,6 +86,15 @@ export function __getSessionsMapForTests(): Map<string, SessionData> {
 	return sessions;
 }
 
+/**
+ * Test-only: returns the sessionOwners map so tests can link
+ * custom session keys to user IDs (needed for findTabById to
+ * recognize sessions with non-default keys).
+ */
+export function __getSessionOwnersForTests(): Map<string, string> {
+	return sessionOwners;
+}
+
 function beginLifecycleIdleClosure(userId: unknown): () => void {
 	const key = normalizeUserId(userId);
 	let state = lifecycleIdleClosures.get(key);
@@ -602,6 +611,37 @@ export async function rollbackSessionProfileRuntime(
 	launchingSessions.delete(sessionMapKey);
 	launchingSessionOwners.delete(sessionMapKey);
 	await contextPool.closeContext(sessionMapKey).catch(() => {});
+}
+
+/**
+ * Tear down a single session by its sessionMapKey: unindex all tabs,
+ * delete the session entry, and close the backing context.
+ *
+ * This is the session-owned teardown used by nav recovery. Unlike
+ * closeContextBySession (which only removes the pool entry), this also
+ * removes the tab/session records from the index so findTabById can no
+ * longer return stale Page objects for the recovered session.
+ *
+ * Sibling sessions for the same user are preserved — only the exact
+ * sessionMapKey is torn down.
+ *
+ * Returns true if a session was found and torn down, false otherwise.
+ */
+export async function teardownSessionByKey(sessionMapKey: string): Promise<boolean> {
+	const normalized = String(sessionMapKey);
+	const session = sessions.get(normalized);
+	if (!session) return false;
+
+	unindexSessionTabs(session);
+	sessions.delete(normalized);
+	sessionOwners.delete(normalized);
+	launchingSessions.delete(normalized);
+	launchingSessionOwners.delete(normalized);
+
+	await contextPool.closeContext(normalized).catch(() => {});
+
+	log('info', 'session torn down by key (nav recovery)', { sessionMapKey: normalized });
+	return true;
 }
 
 export function getSessionsForUser(userId: unknown): Array<[string, SessionData]> {

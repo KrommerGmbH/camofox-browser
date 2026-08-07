@@ -307,20 +307,27 @@ describe('handleNavFailure — route-level lock ownership', () => {
       expect(mockCloseContextBySession).toHaveBeenCalledWith('user-a', 'session-key-1');
     });
 
-    test('session key is forwarded for targeted close, health stays per-user', async () => {
+    test('different session keys have independent health counters', async () => {
       mockCloseContextBySession.mockResolvedValue(undefined);
 
-      // Health counters are per-user (not per-session). Three failures
-      // from the same user with different session keys still accumulate
-      // on the same user's counter. The session key is only used to
-      // target which context gets closed (blast radius reduction).
+      // Health counters are now per-session (keyed by sessionMapKey).
+      // Failures from session-1 and session-2 accumulate independently.
       await handleNavFailure('user-a', 'session-1');
       await handleNavFailure('user-a', 'session-2');
-      // Third failure hits threshold — recovery closes session-1 specifically
+      // Each session has counter=1, neither has hit threshold (3)
+      expect(__getUserHealthForTests('user-a', 'session-1').consecutiveNavFailures).toBe(1);
+      expect(__getUserHealthForTests('user-a', 'session-2').consecutiveNavFailures).toBe(1);
+      expect(mockCloseContextBySession).not.toHaveBeenCalled();
+
+      // Two more failures on session-1 → threshold reached → recovery for session-1
+      await handleNavFailure('user-a', 'session-1');
       await handleNavFailure('user-a', 'session-1');
 
       expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
       expect(mockCloseContextBySession).toHaveBeenLastCalledWith('user-a', 'session-1');
+
+      // Session-2 counter is still 1 — unaffected by session-1's recovery
+      expect(__getUserHealthForTests('user-a', 'session-2').consecutiveNavFailures).toBe(1);
     });
 
     test('no sessionMapKey falls back to user-wide close (backward compat)', async () => {

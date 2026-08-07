@@ -538,8 +538,9 @@ router.post(
 						timeout: 30000,
 					});
 					navError = false;
+					// Record success immediately after navigation resolves.
+					recordNavSuccess(String(userId), sessionMapKey);
 					tabState.visitedUrls.add(url);
-					recordNavSuccess(String(userId));
 				}
 
 				const committed = commitStagedFirstUse(userId, session, contextOverrides, {
@@ -598,8 +599,9 @@ router.post(
 						timeout: 30000,
 					});
 					navError = false;
+					// Record success immediately after navigation resolves.
+					recordNavSuccess(String(userId), sessionMapKey);
 					tabState.visitedUrls.add(url);
-					recordNavSuccess(String(userId));
 				}
 
 				pageUrl = page.url();
@@ -725,6 +727,10 @@ router.post('/tabs/:tabId/navigate', async (req: Request<{ tabId: string }, unkn
 						timeout: 30000,
 					});
 					navError = false;
+					// Record success immediately after navigation resolves —
+					// a buildRefs failure after this must NOT prevent the
+					// counter reset, since the navigation itself succeeded.
+					recordNavSuccess(String(req.body.userId), foundSessionKey);
 
 					tabState.visitedUrls.add(targetUrl);
 					tabState.refs = await buildRefs(tabState.page);
@@ -737,7 +743,6 @@ router.post('/tabs/:tabId/navigate', async (req: Request<{ tabId: string }, unkn
 
 		if (result.status !== 200) return res.status(result.status).json(result.body);
 
-		recordNavSuccess(String(req.body.userId));
 		lifecycleController.recordInteractiveActivity();
 		log('info', 'navigated', { reqId: req.reqId, tabId, url: result.body.url });
 		return res.json(result.body);

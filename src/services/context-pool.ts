@@ -635,7 +635,12 @@ export class ContextPool {
 			// A stale/foreign key must never terminate a different user's session
 			// — fail closed (no-op) rather than escalating to user-wide close.
 			if (entry && entry.userId === normalizedUser && !entry.staged) {
-				await this.closeContext(normalizedProfile);
+				// Full session teardown: unindex tabs, delete session entry,
+				// AND close the backing context. This prevents findTabById
+				// from returning stale Page objects after recovery.
+				// Lazy import to avoid circular dependency with session.ts.
+				const { teardownSessionByKey } = await import('./session');
+				await teardownSessionByKey(normalizedProfile);
 			}
 			// Stale or unmatched key: log and return without closing anything.
 			return;

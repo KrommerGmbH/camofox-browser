@@ -9,14 +9,17 @@ export interface HealthState {
 }
 
 /**
- * Per-user navigation health tracking.
+ * Per-session navigation health tracking.
  *
- * Each user gets an independent failure counter and recovery state.
- * This prevents interleaved failures from different users triggering
- * recovery for the wrong user, and a success from one user resetting
+ * Each session gets an independent failure counter and recovery state.
+ * This prevents interleaved failures from different sessions triggering
+ * recovery for the wrong session, and a success from one session resetting
  * the failure count for another.
+ *
+ * When no session identity is available (legacy callers), a user-wide
+ * key is used as fallback so those callers still get health tracking.
  */
-interface UserNavHealth {
+interface SessionNavHealth {
 	consecutiveNavFailures: number;
 	lastSuccessfulNav: number;
 	recovering: boolean;
@@ -24,14 +27,14 @@ interface UserNavHealth {
 
 const CONFIG = loadConfig();
 
-// Per-user health map. Lazily populated — a user's entry is created
-// on first failure or success. Entries are never deleted (small map,
-// bounded by the number of active users).
-const userHealthMap = new Map<string, UserNavHealth>();
+// Per-session health map. Lazily populated — a session's entry is created
+// on first failure or success. Keyed by sessionMapKey when available,
+// falling back to userId for legacy callers without session identity.
+const sessionHealthMap = new Map<string, SessionNavHealth>();
 
 // Process-global health state — kept for compatibility with the
 // health probe in server.js (lastSuccessfulNav, activeOps, isRecovering).
-// isRecovering is now true if ANY user is recovering.
+// isRecovering is now true if ANY session is recovering.
 const healthState: HealthState = {
 	consecutiveNavFailures: 0,
 	lastSuccessfulNav: Date.now(),
@@ -39,25 +42,39 @@ const healthState: HealthState = {
 	activeOps: 0,
 };
 
-function getUserHealth(userId: string): UserNavHealth {
-	let h = userHealthMap.get(userId);
+/**
+ * Compute the health key for a given userId/sessionKey pair.
+ * When sessionKey is provided, use it directly — this isolates
+ * per-session counters. When absent, fall back to userId for
+ * legacy callers.
+ */
+function healthKey(userId: string, sessionKey?: string): string {
+	if (sessionKey !== undefined && sessionKey !== null && sessionKey !== '') {
+		return String(sessionKey);
+	}
+	return String(userId);
+}
+
+function getSessionHealth(userId: string, sessionKey?: string): SessionNavHealth {
+	const key = healthKey(userId, sessionKey);
+	let h = sessionHealthMap.get(key);
 	if (!h) {
 		h = {
 			consecutiveNavFailures: 0,
 			lastSuccessfulNav: Date.now(),
 			recovering: false,
 		};
-		userHealthMap.set(userId, h);
+		sessionHealthMap.set(key, h);
 	}
 	return h;
 }
 
 export function getHealthState(): Readonly<HealthState> {
-	// Aggregate per-user state into the process-global view.
+	// Aggregate per-session state into the process-global view.
 	let totalFailures = 0;
 	let anyRecovering = false;
 	let latestNav = healthState.lastSuccessfulNav;
-	for (const h of userHealthMap.values()) {
+	for (const h of sessionHealthMap.values()) {
 		totalFailures += h.consecutiveNavFailures;
 		if (h.recovering) anyRecovering = true;
 		if (h.lastSuccessfulNav > latestNav) latestNav = h.lastSuccessfulNav;
@@ -69,28 +86,29 @@ export function getHealthState(): Readonly<HealthState> {
 }
 
 /**
- * Records a navigation success for a specific user.
- * Resets only that user's failure counter.
+ * Records a navigation success for a specific session.
+ * Resets only that session's failure counter.
  */
-export function recordNavSuccess(userId: string): void {
-	const h = getUserHealth(userId);
+export function recordNavSuccess(userId: string, sessionKey?: string): void {
+	const h = getSessionHealth(userId, sessionKey);
 	h.consecutiveNavFailures = 0;
 	h.lastSuccessfulNav = Date.now();
 	healthState.lastSuccessfulNav = h.lastSuccessfulNav;
 }
 
 /**
- * Records a navigation failure for a specific user.
- * Returns true when that user's consecutive failures exceed the
- * threshold, signaling the caller to recover that user's browser context.
+ * Records a navigation failure for a specific session.
+ * Returns true when that session's consecutive failures exceed the
+ * threshold, signaling the caller to recover that session's browser context.
  */
-export function recordNavFailure(userId: string): boolean {
-	const h = getUserHealth(userId);
+export function recordNavFailure(userId: string, sessionKey?: string): boolean {
+	const h = getSessionHealth(userId, sessionKey);
 	h.consecutiveNavFailures++;
 	const exceeded = h.consecutiveNavFailures >= CONFIG.failureThreshold;
 	if (exceeded) {
 		log('error', 'consecutive navigation failures exceeded threshold', {
 			userId,
+			sessionKey: sessionKey ?? null,
 			consecutiveFailures: h.consecutiveNavFailures,
 			failureThreshold: CONFIG.failureThreshold,
 		});
@@ -99,33 +117,34 @@ export function recordNavFailure(userId: string): boolean {
 }
 
 /**
- * Attempts to acquire the single-flight recovery lock for a user.
+ * Attempts to acquire the single-flight recovery lock for a session.
  * Returns true if acquired (caller should proceed with recovery),
- * false if a recovery for this user is already in flight.
+ * false if a recovery for this session is already in flight.
  */
-export function acquireRecoveryLock(userId: string): boolean {
-	const h = getUserHealth(userId);
+export function acquireRecoveryLock(userId: string, sessionKey?: string): boolean {
+	const h = getSessionHealth(userId, sessionKey);
 	if (h.recovering) return false;
 	h.recovering = true;
 	return true;
 }
 
 /**
- * Releases the single-flight recovery lock for a user.
- * Resets the user's failure counter — recovery was attempted, so
+ * Releases the single-flight recovery lock for a session.
+ * Resets that session's failure counter — recovery was attempted, so
  * the next batch of failures starts fresh.
  */
-export function releaseRecoveryLock(userId: string): void {
-	const h = getUserHealth(userId);
+export function releaseRecoveryLock(userId: string, sessionKey?: string): void {
+	const h = getSessionHealth(userId, sessionKey);
 	h.recovering = false;
 	h.consecutiveNavFailures = 0;
 }
 
 /**
- * Checks whether a user is currently recovering.
+ * Checks whether a session is currently recovering.
  */
-export function isUserRecovering(userId: string): boolean {
-	const h = userHealthMap.get(userId);
+export function isUserRecovering(userId: string, sessionKey?: string): boolean {
+	const key = healthKey(userId, sessionKey);
+	const h = sessionHealthMap.get(key);
 	return h?.recovering ?? false;
 }
 
@@ -142,7 +161,7 @@ export function setRecovering(value: boolean): void {
 }
 
 export function resetHealth(): void {
-	userHealthMap.clear();
+	sessionHealthMap.clear();
 	healthState.consecutiveNavFailures = 0;
 	healthState.lastSuccessfulNav = Date.now();
 	healthState.isRecovering = false;
@@ -150,22 +169,24 @@ export function resetHealth(): void {
 }
 
 /**
- * Evicts a user's health entry from the map. Called after recovery
+ * Evicts a session's health entry from the map. Called after recovery
  * completes to prevent the map from growing unbounded over the
- * process lifetime. Safe to call even if the user has no entry.
+ * process lifetime. Safe to call even if the session has no entry.
  */
-export function deleteUserHealth(userId: string): void {
-	userHealthMap.delete(userId);
+export function deleteUserHealth(userId: string, sessionKey?: string): void {
+	const key = healthKey(userId, sessionKey);
+	sessionHealthMap.delete(key);
 }
 
 // ── Test-only exports ──────────────────────────────────────────────
-// These allow unit tests to inspect and manipulate the per-user health
+// These allow unit tests to inspect and manipulate the per-session health
 // map without relying on the process-global aggregate. Not part of the
 // public API.
-export function __getUserHealthForTests(userId: string): UserNavHealth | undefined {
-	return userHealthMap.get(userId);
+export function __getUserHealthForTests(userId: string, sessionKey?: string): SessionNavHealth | undefined {
+	const key = healthKey(userId, sessionKey);
+	return sessionHealthMap.get(key);
 }
 
 export function __clearUserHealthForTests(): void {
-	userHealthMap.clear();
+	sessionHealthMap.clear();
 }
