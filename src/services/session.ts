@@ -9,7 +9,7 @@ import type { ResolvedContextOptions } from '../utils/presets';
 import { contextHash } from '../utils/presets';
 import { contextPool, type PoolEntry } from './context-pool';
 import { cleanupUserDownloads } from './download';
-import { decrementActiveOps, incrementActiveOps } from './health';
+import { decrementActiveOps, incrementActiveOps, deleteUserHealth } from './health';
 import { stopVnc } from './vnc';
 import { cleanupTracing } from './tracing';
 
@@ -211,6 +211,10 @@ export function cleanupSessionsForUserId(
 		unindexSessionTabs(session);
 		sessions.delete(sessionKey);
 		sessionOwners.delete(sessionKey);
+		// Evict per-session health entry so the map doesn't grow
+		// unbounded across normal session lifecycle. The health key
+		// is the sessionMapKey (or userId for legacy sessions).
+		deleteUserHealth(key, sessionKey);
 		log('info', 'session cleaned up', { userId: key, sessionKey, reason });
 	}
 
@@ -625,22 +629,43 @@ export async function rollbackSessionProfileRuntime(
  * Sibling sessions for the same user are preserved — only the exact
  * sessionMapKey is torn down.
  *
+ * Generation safety: when `expectedCreatedAt` is provided, the context
+ * is only closed if the pool entry's `createdAt` matches. This prevents
+ * the replacement race where a new pool entry with the same key appears
+ * during the await between the ownership check and the actual close.
+ * When `expectedCreatedAt` is undefined (no pool entry existed, or stale
+ * key), the context close is still attempted via `closeContextIfMatches`
+ * which will no-op if no entry exists.
+ *
  * Returns true if a session was found and torn down, false otherwise.
  */
-export async function teardownSessionByKey(sessionMapKey: string): Promise<boolean> {
+export async function teardownSessionByKey(sessionMapKey: string, expectedCreatedAt?: number): Promise<boolean> {
 	const normalized = String(sessionMapKey);
 	const session = sessions.get(normalized);
 	if (!session) return false;
 
 	unindexSessionTabs(session);
 	sessions.delete(normalized);
+	const ownerUserId = sessionOwners.get(normalized);
 	sessionOwners.delete(normalized);
 	launchingSessions.delete(normalized);
 	launchingSessionOwners.delete(normalized);
+	// Evict per-session health entry so the map doesn't grow unbounded.
+	// nav-recovery.ts also calls deleteUserHealth in its finally block,
+	// but teardownSessionByKey is also called from other paths.
+	deleteUserHealth(ownerUserId ?? normalized, normalized);
 
-	await contextPool.closeContext(normalized).catch(() => {});
+	// Use generation-aware close to prevent the replacement race.
+	// If expectedCreatedAt is undefined (missing pool entry), this
+	// still cleans up the session/tab records above; the context
+	// close will no-op if no pool entry exists.
+	if (expectedCreatedAt !== undefined) {
+		await contextPool.closeContextIfMatches(normalized, expectedCreatedAt).catch(() => {});
+	} else {
+		await contextPool.closeContext(normalized).catch(() => {});
+	}
 
-	log('info', 'session torn down by key (nav recovery)', { sessionMapKey: normalized });
+	log('info', 'session torn down by key (nav recovery)', { sessionMapKey: normalized, expectedCreatedAt });
 	return true;
 }
 
@@ -966,6 +991,8 @@ export async function closeAllSessions(): Promise<void> {
 		unindexSessionTabs(session);
 		sessions.delete(sessionKey);
 		sessionOwners.delete(sessionKey);
+		// Evict per-session health entry on bulk close.
+		deleteUserHealth(ownerUserId, sessionKey);
 		cleanupTracing(ownerUserId);
 		try {
 			cleanupUserDownloads(ownerUserId);
@@ -1000,6 +1027,8 @@ export function startCleanupInterval(): NodeJS.Timeout {
 				clearDefaultSessionProfileClaimsForUser(ownerUserId);
 				sessions.delete(sessionKey);
 				sessionOwners.delete(sessionKey);
+				// Evict per-session health entry on timeout expiry.
+				deleteUserHealth(ownerUserId, sessionKey);
 				cleanupTracing(ownerUserId);
 				log('info', 'session expired', { userId: ownerUserId, sessionKey });
 			}

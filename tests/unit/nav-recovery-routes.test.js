@@ -24,24 +24,39 @@
 const mockCloseContext = jest.fn();
 const mockCloseContextByUserId = jest.fn();
 
+// Real pool Map to faithfully replicate closeContextBySession's pool-entry
+// check and generation tracking. This replaces the previous semantic
+// substitution (sessions.has for pool.has) that hid the missing-pool-entry
+// and replacement-race bugs.
+const mockPool = new Map();
+
 // We do NOT mock closeContextBySession — we let it call the real
 // teardownSessionByKey so we can verify real tab unindexing behavior.
-// The contextPool mock delegates to teardownSessionByKey for matched keys.
+// The contextPool mock delegates to teardownSessionByKey for matched keys,
+// using the same generation-aware logic as the production code.
 const mockCloseContextBySession = jest.fn(async (userId, profileKey) => {
   if (profileKey !== undefined && profileKey !== null && profileKey !== '') {
-    // Mirror the real fail-closed logic: check if the pool entry exists.
-    // For tests, we check if the session exists in the sessions map.
+    // Mirror the real closeContextBySession: capture the pool entry's
+    // generation before the await, then pass it to teardownSessionByKey.
+    const entry = mockPool.get(profileKey);
+    const ownerMatches = entry && entry.userId === String(userId) && !entry.staged;
+    const generation = ownerMatches ? entry.createdAt : undefined;
+
     const sessionModule = require('../../dist/src/services/session');
-    const sessions = sessionModule.__getSessionsMapForTests();
-    if (sessions.has(profileKey)) {
-      // Real teardown: unindex tabs + delete session + close context
-      await sessionModule.teardownSessionByKey(profileKey);
-    }
-    // Stale/unmatched key → no-op (fail closed)
+    await sessionModule.teardownSessionByKey(profileKey, generation);
     return;
   }
   // No key → user-wide fallback
   await mockCloseContextByUserId(userId);
+});
+
+// Generation-aware close: matches the real closeContextIfMatches logic.
+const mockCloseContextIfMatches = jest.fn(async (profileKey, expectedCreatedAt) => {
+  const entry = mockPool.get(profileKey);
+  if (!entry) return;
+  if (entry.createdAt !== expectedCreatedAt) return;
+  mockPool.delete(profileKey);
+  mockCloseContext(profileKey);
 });
 
 jest.mock('../../dist/src/services/context-pool', () => ({
@@ -49,11 +64,13 @@ jest.mock('../../dist/src/services/context-pool', () => ({
     closeContext: mockCloseContext,
     closeContextBySession: mockCloseContextBySession,
     closeContextByUserId: mockCloseContextByUserId,
-    getPoolEntries: jest.fn(() => new Map()),
+    closeContextIfMatches: mockCloseContextIfMatches,
+    getPoolEntries: jest.fn(() => mockPool),
     onEvict: jest.fn(),
     evictIfNeeded: jest.fn(async () => {}),
     acquire: jest.fn(),
     release: jest.fn(),
+    getEntry: jest.fn((key) => mockPool.get(key)),
   },
   getDisplayForUser: jest.fn(() => null),
 }));
@@ -114,7 +131,7 @@ jest.mock('../../dist/src/services/lifecycle-controller', () => ({
 // Mock vnc
 jest.mock('../../dist/src/services/vnc', () => ({
   startVnc: jest.fn(),
-  stopVnc: jest.fn(),
+  stopVnc: jest.fn().mockResolvedValue(undefined),
   stopAllVnc: jest.fn(),
 }));
 
@@ -354,6 +371,7 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
     __clearUserHealthForTests();
     resetHealth();
     cleanupSessions();
+    mockPool.clear();
   });
 
   // ── 1. Non-navigation errors do not count ─────────────────────
@@ -739,6 +757,173 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
         .expect(500);
 
       expect(__getUserHealthForTests(userId, sessionKey)?.consecutiveNavFailures).toBe(2);
+    });
+  });
+
+  // ── 9. Missing pool entry — session/tab records still cleaned up ──
+
+  describe('boundary — indexed session + missing pool entry', () => {
+    test('teardown proceeds even when pool entry is already gone', async () => {
+      const userId = 'test-user-missing-pool';
+      const tabId = 'tab-missing-pool';
+      const sessionKey = 'session-key-missing-pool';
+
+      // Set up a session with a tab, but NO pool entry (simulates
+      // an unexpected context close that already removed the pool entry).
+      const sessions = sessionModule.__getSessionsMapForTests();
+      const sessionOwners = sessionModule.__getSessionOwnersForTests();
+      const session = {
+        context: { close: jest.fn().mockResolvedValue(undefined) },
+        tabGroups: new Map([[sessionKey, new Map([[tabId, {
+          page: { url: () => 'about:blank', close: jest.fn() },
+          visitedUrls: new Set(),
+          refs: new Map(),
+          toolCalls: 0,
+          downloads: [],
+        }]])]]),
+        lastAccess: Date.now(),
+      };
+      sessions.set(sessionKey, session);
+      sessionOwners.set(sessionKey, String(userId));
+      sessionModule.indexTab(tabId, sessionKey);
+
+      // Verify tab is findable before recovery
+      expect(sessionModule.findTabById(tabId, userId)).not.toBeNull();
+
+      // No pool entry for this sessionKey
+      expect(mockPool.get(sessionKey)).toBeUndefined();
+
+      // Trigger recovery via handleNavFailure (3 failures)
+      mockNavigate.mockRejectedValue(new Error('nav fail'));
+      for (let i = 0; i < 3; i++) {
+        await supertest(app)
+          .post(`/tabs/${tabId}/navigate`)
+          .send({ userId, url: 'http://example.com' })
+          .expect(500);
+      }
+
+      // The session/tab records should be cleaned up even without a pool entry
+      expect(sessionModule.findTabById(tabId, userId)).toBeNull();
+      expect(sessions.has(sessionKey)).toBe(false);
+    });
+  });
+
+  // ── 10. Replacement race — old entry closed, new entry preserved ──
+
+  describe('boundary — old/new entry replacement during recovery', () => {
+    test('teardownSessionByKey with old generation does not close newer entry', async () => {
+      const sessionKey = 'session-key-gen-test';
+      const userId = 'test-user-gen';
+
+      // Set up a session
+      const sessions = sessionModule.__getSessionsMapForTests();
+      const sessionOwners = sessionModule.__getSessionOwnersForTests();
+      sessions.set(sessionKey, {
+        context: { close: jest.fn().mockResolvedValue(undefined) },
+        tabGroups: new Map([[sessionKey, new Map()]]),
+        lastAccess: Date.now(),
+      });
+      sessionOwners.set(sessionKey, userId);
+
+      // Set up a NEW pool entry with createdAt=2000
+      const newCreatedAt = 2000;
+      mockPool.set(sessionKey, { userId, createdAt: newCreatedAt, staged: false });
+      mockCloseContext.mockClear();
+      mockCloseContextIfMatches.mockClear();
+
+      // Call teardown with the OLD generation (1000) — this simulates
+      // the race where the pool entry was replaced during the await.
+      await sessionModule.teardownSessionByKey(sessionKey, 1000);
+
+      // The session/tab records are cleaned up regardless (teardown always runs)
+      expect(sessions.has(sessionKey)).toBe(false);
+
+      // The NEW pool entry should NOT have been closed (generation mismatch)
+      // closeContextIfMatches should have been called but should NOT have deleted the entry
+      expect(mockCloseContextIfMatches).toHaveBeenCalledWith(sessionKey, 1000);
+      expect(mockCloseContext).not.toHaveBeenCalled();
+
+      // Pool entry survives
+      const entry = mockPool.get(sessionKey);
+      expect(entry).toBeDefined();
+      expect(entry.createdAt).toBe(newCreatedAt);
+    });
+
+    test('teardownSessionByKey with matching generation closes the entry', async () => {
+      const sessionKey = 'session-key-gen-match';
+      const userId = 'test-user-gen-match';
+
+      const sessions = sessionModule.__getSessionsMapForTests();
+      const sessionOwners = sessionModule.__getSessionOwnersForTests();
+      sessions.set(sessionKey, {
+        context: { close: jest.fn().mockResolvedValue(undefined) },
+        tabGroups: new Map([[sessionKey, new Map()]]),
+        lastAccess: Date.now(),
+      });
+      sessionOwners.set(sessionKey, userId);
+
+      const createdAt = 5000;
+      mockPool.set(sessionKey, { userId, createdAt, staged: false });
+      mockCloseContext.mockClear();
+      mockCloseContextIfMatches.mockClear();
+
+      await sessionModule.teardownSessionByKey(sessionKey, createdAt);
+
+      // The entry should be closed and removed from the pool
+      expect(mockCloseContextIfMatches).toHaveBeenCalledWith(sessionKey, createdAt);
+      expect(mockCloseContext).toHaveBeenCalledWith(sessionKey);
+      expect(mockPool.get(sessionKey)).toBeUndefined();
+      expect(sessions.has(sessionKey)).toBe(false);
+    });
+  });
+
+  // ── 11. Health eviction on ordinary session close/expiry ──────────
+
+  describe('boundary — health eviction on ordinary session close', () => {
+    test('cleanupSessionsForUserId evicts per-session health entries', () => {
+      const userId = 'test-user-health-eviction';
+      const sessionKey = sessionModule.getSessionMapKey(userId, null);
+
+      // Set up a session
+      setupFakeTab(userId, 'tab-health-eviction');
+
+      // Create a health entry for this session
+      recordNavFailure(userId, sessionKey);
+      recordNavFailure(userId, sessionKey);
+      expect(__getUserHealthForTests(userId, sessionKey)?.consecutiveNavFailures).toBe(2);
+
+      // Trigger ordinary session cleanup (not recovery — just normal close)
+      sessionModule.cleanupSessionsForUserId(userId, 'test_cleanup');
+
+      // Health entry should be evicted
+      expect(__getUserHealthForTests(userId, sessionKey)).toBeUndefined();
+    });
+
+    test('one sessions health entry is evicted without affecting siblings', () => {
+      const userId = 'test-user-sibling-eviction';
+      const sessionKeyA = 'session-key-evict-a';
+      const sessionKeyB = 'session-key-evict-b';
+
+      setupSiblingSessions(userId, 'tab-evict-a', sessionKeyA, 'tab-evict-b', sessionKeyB);
+
+      // Create health entries for both sessions
+      recordNavFailure(userId, sessionKeyA);
+      recordNavFailure(userId, sessionKeyA);
+      recordNavFailure(userId, sessionKeyB);
+
+      expect(__getUserHealthForTests(userId, sessionKeyA)?.consecutiveNavFailures).toBe(2);
+      expect(__getUserHealthForTests(userId, sessionKeyB)?.consecutiveNavFailures).toBe(1);
+
+      // Delete only session A from the sessions map (simulating targeted cleanup)
+      const sessions = sessionModule.__getSessionsMapForTests();
+      sessions.delete(sessionKeyA);
+
+      // cleanupSessionsForUserId is user-wide; but we can test the per-session
+      // eviction by calling deleteUserHealth directly for session A
+      deleteUserHealth(userId, sessionKeyA);
+
+      expect(__getUserHealthForTests(userId, sessionKeyA)).toBeUndefined();
+      expect(__getUserHealthForTests(userId, sessionKeyB)?.consecutiveNavFailures).toBe(1);
     });
   });
 });

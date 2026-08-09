@@ -630,19 +630,27 @@ export class ContextPool {
 		const normalizedUser = String(userId);
 		if (profileKey !== undefined && profileKey !== null && profileKey !== '') {
 			const normalizedProfile = String(profileKey);
+
+			// Capture the current pool entry's generation timestamp before
+			// any await. This prevents the replacement race: if a new entry
+			// with the same key appears during the dynamic import / teardown
+			// await, the generation check below will NOT close the newer
+			// healthy context.
 			const entry = this.pool.get(normalizedProfile);
-			// Only close if the key maps to a real context owned by this user.
-			// A stale/foreign key must never terminate a different user's session
-			// — fail closed (no-op) rather than escalating to user-wide close.
-			if (entry && entry.userId === normalizedUser && !entry.staged) {
-				// Full session teardown: unindex tabs, delete session entry,
-				// AND close the backing context. This prevents findTabById
-				// from returning stale Page objects after recovery.
-				// Lazy import to avoid circular dependency with session.ts.
-				const { teardownSessionByKey } = await import('./session');
-				await teardownSessionByKey(normalizedProfile);
-			}
-			// Stale or unmatched key: log and return without closing anything.
+			const ownerMatches = entry && entry.userId === normalizedUser && !entry.staged;
+			const generation = ownerMatches ? entry.createdAt : undefined;
+
+			// Full session teardown: unindex tabs, delete session entry,
+			// AND close the backing context. This runs even when the pool
+			// entry is missing — an unexpected context close may have
+			// already removed the pool entry, but the session/tab records
+			// in session.ts are still indexed and must be cleaned up so
+			// findTabById stops returning stale Page objects.
+			//
+			// Lazy import to avoid circular dependency with session.ts.
+			const { teardownSessionByKey } = await import('./session');
+			await teardownSessionByKey(normalizedProfile, generation);
+
 			return;
 		}
 		// No profile key provided — legacy caller without session identity.
