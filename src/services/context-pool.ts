@@ -14,7 +14,7 @@ import { firefox, type BrowserContext, type BrowserContextOptions } from 'playwr
 
 import { loadConfig } from '../utils/config';
 import { assertBrowserPlatformSupported, getHostArchitecture, getHostOS } from '../utils/platform-support';
-import { profileDirForProfileKey } from '../utils/profile-path';
+import { resolveProfileDirForProfileKey } from '../utils/profile-path';
 import { readVersionedSidecar, writeVersionedSidecar } from '../utils/sidecar-version';
 import { log } from '../middleware/logging';
 import type { ResolvedProxyConfig } from '../types';
@@ -340,7 +340,7 @@ export class ContextPool {
 		const headless = this.headlessOverrides.get(userId) ?? CONFIG.headless;
 		assertBrowserPlatformSupported(hostOS, getHostArchitecture(), headless);
 
-		const profileDir = profileDirForProfileKey(CONFIG.profilesDir, profileKey);
+		const profileDir = resolveProfileDirForProfileKey(CONFIG.profilesDir, profileKey);
 		fs.mkdirSync(profileDir, { recursive: true });
 		const compatPath = path.join(profileDir, 'compatibility.json');
 
@@ -604,7 +604,7 @@ export class ContextPool {
 			return entry;
 		}
 
-		const profileDir = profileDirForProfileKey(CONFIG.profilesDir, profileKey);
+		const profileDir = resolveProfileDirForProfileKey(CONFIG.profilesDir, profileKey);
 		const newEntry: PoolEntry = {
 			context: null as unknown as BrowserContext,
 			userId: normalized,

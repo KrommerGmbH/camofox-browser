@@ -483,7 +483,7 @@ AI Agent (MCP / OpenClaw / REST Client)
 ### Persistent Profiles (v1.3.0)
 
 - Each `userId` runs in its own persistent Firefox process/context (backed by `launchPersistentContext(userDataDir)`)
-- Profile data is stored under `~/.camofox/profiles/` (override via `CAMOFOX_PROFILES_DIR`). Linux/macOS keep the readable default-user directory name; Windows uses a deterministic hashed directory name so case-insensitive or trailing-dot/space-equivalent user IDs cannot share a Firefox profile.
+- Profile data is stored under `~/.camofox/profiles/` (override via `CAMOFOX_PROFILES_DIR`). Linux/macOS keep the readable default-user directory name; new Windows profiles use a deterministic hashed directory name so case-insensitive or trailing-dot/space-equivalent user IDs cannot share a Firefox profile. Existing Windows directories from the previous layout are read in place only when their exact on-disk name is unambiguous and no hashed directory also exists; conflicting layouts fail closed with both recovery paths in the error.
 - Idle user contexts are closed via LRU eviction (profile data remains on disk)
 
 ## API Reference

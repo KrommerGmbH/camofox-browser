@@ -1,6 +1,10 @@
 const path = require('path');
 
-const { profileDirForProfileKey } = require('../../dist/src/utils/profile-path');
+const {
+  previousProfileDirForProfileKey,
+  profileDirForProfileKey,
+  resolveProfileDirForProfileKey,
+} = require('../../dist/src/utils/profile-path');
 
 const PROFILES_DIR = path.join(path.sep, 'tmp', 'camofox-test-profiles');
 
@@ -60,5 +64,82 @@ describe('context pool profile directory paths', () => {
     expect(lowerDir).toMatch(/^profile-[0-9a-f]{64}$/);
     expect(dottedDir).toMatch(/^profile-[0-9a-f]{64}$/);
     expect(new Set([upperDir, lowerDir, dottedDir]).size).toBe(3);
+  });
+
+  test('keeps a read path to the previous Windows default-user directory format', () => {
+    const profileKey = `u:${encodeKeyComponent('existing-user')}`;
+    const legacyDir = previousProfileDirForProfileKey(PROFILES_DIR, profileKey, 'win32');
+    const currentDir = profileDirForProfileKey(PROFILES_DIR, profileKey, 'win32');
+
+    expect(path.basename(legacyDir)).toBe('existing-user');
+    expect(legacyDir).not.toBe(currentDir);
+    expect(resolveProfileDirForProfileKey(
+      PROFILES_DIR,
+      profileKey,
+      'win32',
+      {
+        existsSync: (candidate) => candidate === legacyDir,
+        readdirSync: () => [path.basename(legacyDir)],
+      },
+    )).toBe(legacyDir);
+  });
+
+  test('keeps a read path to the previous Windows session-profile directory format', () => {
+    const profileKey = `s:${encodeKeyComponent('existing-user')}:${encodeKeyComponent('main')}`;
+    const legacyDir = previousProfileDirForProfileKey(PROFILES_DIR, profileKey, 'win32');
+    const currentDir = profileDirForProfileKey(PROFILES_DIR, profileKey, 'win32');
+
+    expect(path.basename(legacyDir)).toBe(encodeURIComponent(profileKey));
+    expect(legacyDir).not.toBe(currentDir);
+    expect(resolveProfileDirForProfileKey(
+      PROFILES_DIR,
+      profileKey,
+      'win32',
+      {
+        existsSync: (candidate) => candidate === legacyDir,
+        readdirSync: () => [path.basename(legacyDir)],
+      },
+    )).toBe(legacyDir);
+  });
+
+  test('uses the hashed Windows directory for new profiles when no legacy state exists', () => {
+    const profileKey = `u:${encodeKeyComponent('new-user')}`;
+    const currentDir = profileDirForProfileKey(PROFILES_DIR, profileKey, 'win32');
+
+    expect(resolveProfileDirForProfileKey(
+      PROFILES_DIR,
+      profileKey,
+      'win32',
+      { existsSync: () => false, readdirSync: () => [] },
+    )).toBe(currentDir);
+  });
+
+  test('fails closed when both previous and current Windows profile directories exist', () => {
+    const profileKey = `u:${encodeKeyComponent('ambiguous-user')}`;
+
+    expect(() => resolveProfileDirForProfileKey(
+      PROFILES_DIR,
+      profileKey,
+      'win32',
+      {
+        existsSync: () => true,
+        readdirSync: () => [path.basename(previousProfileDirForProfileKey(PROFILES_DIR, profileKey, 'win32'))],
+      },
+    )).toThrow(/both the current and previous Windows profile directories exist/);
+  });
+
+  test('fails closed when a Windows-equivalent legacy path has a different exact on-disk name', () => {
+    const profileKey = `u:${encodeKeyComponent('Alice')}`;
+    const legacyDir = previousProfileDirForProfileKey(PROFILES_DIR, profileKey, 'win32');
+
+    expect(() => resolveProfileDirForProfileKey(
+      PROFILES_DIR,
+      profileKey,
+      'win32',
+      {
+        existsSync: (candidate) => candidate === legacyDir,
+        readdirSync: () => ['alice'],
+      },
+    )).toThrow(/case or trailing-dot\/space alias/);
   });
 });

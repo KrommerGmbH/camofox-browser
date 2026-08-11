@@ -88,7 +88,7 @@ Camofox differs from generic browser tools by using Camoufox launch options and 
 - Generated fingerprint (`generateFingerprint`) persisted per profile dir
 - Humanization enabled (`humanize: true`)
 - Proxy-aware geo behavior (`geoip: true` when proxy configured)
-- Persistent contexts per user (`~/.camofox/profiles/<user>`) to keep believable identity continuity
+- Persistent contexts per user under `~/.camofox/profiles/`; Linux/macOS keep readable default-user names while Windows uses collision-safe hashed internal profile keys
 
 Operational anti-detection behaviors:
 - Stable identity per `userId`

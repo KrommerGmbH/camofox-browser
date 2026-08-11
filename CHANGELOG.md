@@ -18,7 +18,7 @@
 
 ### Fixed
 - Windows now rejects headed and virtual/Xvfb/VNC display modes before Linux-only display processes can be attempted, while preserving existing Linux/macOS display behavior.
-- Windows persistent profile directories now use deterministic hashed internal keys, preventing distinct case-sensitive user/session identities from aliasing on case-insensitive Windows filesystems while leaving Linux/macOS profile naming unchanged.
+- New Windows persistent profile directories now use deterministic hashed internal keys, preventing distinct case-sensitive user/session identities from aliasing on case-insensitive Windows filesystems while leaving Linux/macOS profile naming unchanged. Existing Windows directories from the previous layout remain readable in place when the exact legacy name is unambiguous; if both old and hashed directories exist, or Windows resolves a different case/trailing-dot/space-equivalent legacy name, profile launch fails closed and reports the paths to back up/reconcile instead of silently choosing or migrating state.
 
 ### Tests
 - Added focused Windows platform and VNC side-effect regression tests plus a launcher test that removes Node from `PATH` and verifies the current runtime is reused.
