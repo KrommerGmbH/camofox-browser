@@ -14,10 +14,16 @@ module.exports = {
   testPathIgnorePatterns: [
     '/node_modules/'
   ],
+
+  // Generated release artifacts contain a second package.json and must not be
+  // indexed as source modules after local portable-package builds.
+  modulePathIgnorePatterns: [
+    '<rootDir>/build/'
+  ],
   
   // Setup and teardown
-  globalSetup: undefined,
-  globalTeardown: undefined,
+  globalSetup: '<rootDir>/tests/helpers/global-test-state-setup.js',
+  globalTeardown: '<rootDir>/tests/helpers/global-test-state-teardown.js',
   
   // Verbose output
   verbose: true,

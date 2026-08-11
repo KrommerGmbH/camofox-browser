@@ -13,6 +13,7 @@
 - [Features](#features)
 - [Preview Status](#preview-status)
 - [Quick Start](#quick-start)
+- [Windows x64 Portable](#windows-x64-portable)
 - [CLI](#cli)
 - [Console Capture](#console-capture)
 - [Playwright Tracing](#playwright-tracing)
@@ -127,6 +128,25 @@ camofox click e5
 ```
 
 > See [CLI](#cli) for the complete command reference.
+
+## Windows x64 Portable
+
+Windows x64 is supported as a headless-first portable distribution. Release ZIPs are named `camofox-browser-<version>-windows-x64.zip` and contain the Node.js runtime, application runtime, and the pinned Camoufox Windows x64 engine, so a global Node.js installation is not required.
+
+Extract the ZIP to a writable directory and run the bundled launchers from PowerShell or Command Prompt:
+
+```powershell
+.\camofox.cmd --version
+.\camofox.cmd server start --background
+.\camofox.cmd server status
+.\camofox.cmd server stop
+```
+
+Portable runtime state stays under `data\home` inside the extracted directory. This includes camofox-browser's `.camofox` profiles/logs and the bundled Camoufox cache, so the portable distribution does not use the normal Windows user profile for its application state.
+
+The supported Windows x64 display contract is `headless=true`. `headless=false` and `headless="virtual"` are rejected with a clear error before any Linux-only display process is attempted. Xvfb/VNC virtual display mode remains Linux-only, and native headed Windows mode is not part of the verified support contract.
+
+The release workflow verifies the ZIP after extracting it into a path containing spaces, starts the CLI using bundled Node.js with global Node removed from `PATH`, checks `/health`, runs a local create → navigate → snapshot → close browser flow, and confirms server shutdown and portable-state placement.
 
 ### Using Docker
 
@@ -539,6 +559,8 @@ POST /sessions/:userId/toggle-display
 **Auth:** Conditional — requires `Authorization: Bearer $CAMOFOX_API_KEY` when `CAMOFOX_AUTH_MODE=required` or when `auto` mode has an API key configured. No auth is required in `CAMOFOX_AUTH_MODE=disabled`.
 Switch browser between headless and headed mode. When encountering CAPTCHAs or issues requiring visual interaction, switch to headed mode to show the browser window.
 
+**Platform note:** The Windows x64 contract is headless-only. Requests with `headless: false` or `headless: "virtual"` return HTTP 400 on Windows. The Xvfb/VNC behavior described below is Linux-only.
+
 Returns:
 ```json
 {"ok": true, "headless": "virtual", "vncUrl": "http://localhost:6080/vnc.html?autoconnect=true&resize=scale&token=...", "message": "Browser visible via VNC", "userId": "agent1"}
@@ -547,7 +569,7 @@ Returns:
 **Note:** This restarts the browser context. All tabs are invalidated but cookies/auth state persist via the persistent profile.
 
 ### Browser Viewer (noVNC)
-When the display mode is set to `"virtual"` or `false`, the server automatically starts a VNC viewer accessible via web browser.
+On Linux, when the display mode is set to `"virtual"` or a headed request requires a virtual display, the server can start a VNC viewer accessible via web browser.
 
 ```bash
 # 1. Switch to virtual mode
@@ -839,7 +861,7 @@ Then use profiles by name in API requests or CLI commands.
 | `CAMOFOX_AUTH_MODE` | `auto` | API-key policy: `auto` allows loopback without auth and requires `CAMOFOX_API_KEY` for non-loopback binds; `required` requires `CAMOFOX_API_KEY` for every bind; `disabled` disables API-key auth for protected endpoints and is only for trusted private agent networks. |
 | `CAMOFOX_API_KEY` | (empty) | Guards protected endpoints (tab creation, navigation, interaction, session management, downloads, image extraction, tracing, console) via `Authorization: Bearer` header when set. Required in `CAMOFOX_AUTH_MODE=required`, and required by `auto` whenever `CAMOFOX_HOST` exposes the server beyond loopback. Must be unset when `CAMOFOX_AUTH_MODE=disabled`. |
 | `CAMOFOX_ALLOW_PRIVATE_NETWORK` | `true` on loopback binds, `false` otherwise | Allows navigation to loopback/private/link-local/metadata targets. Leave unset for the safe default; enable only for trusted deployments that intentionally need internal-network reachability. |
-| `CAMOFOX_HEADLESS` | `true` | Display mode: `true` (headless), `false` (headed), `virtual` (Xvfb) |
+| `CAMOFOX_HEADLESS` | `true` | Display mode: `true` (headless), `false` (headed), `virtual` (Xvfb). Windows x64 supports `true` only; Xvfb/VNC is Linux-only. |
 | `CAMOFOX_VNC_RESOLUTION` | `1920x1080x24` | Virtual Xvfb display resolution (`WIDTHxHEIGHTxDEPTH`) |
 | `CAMOFOX_VNC_TIMEOUT_MS` | `120000` | Max VNC session duration in ms before auto-stop |
 | `CAMOFOX_EVAL_EXTENDED_RATE_LIMIT_MAX` | `20` | Max evaluate-extended requests per user per window |

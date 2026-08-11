@@ -26,6 +26,9 @@ export interface FingerprintDefaults {
 export interface ServerEnv {
   PATH?: string;
   HOME?: string;
+  USERPROFILE?: string;
+  APPDATA?: string;
+  LOCALAPPDATA?: string;
   NODE_ENV?: string;
   DISPLAY?: string;
   HANDLER_TIMEOUT_MS?: string;
@@ -438,6 +441,9 @@ export function loadConfig(env: ConfigEnv = process.env): AppConfig {
     serverEnv: {
       PATH: env.PATH,
       HOME: env.HOME,
+      USERPROFILE: env.USERPROFILE,
+      APPDATA: env.APPDATA,
+      LOCALAPPDATA: env.LOCALAPPDATA,
       NODE_ENV: env.NODE_ENV,
       DISPLAY: env.DISPLAY,
       CAMOFOX_HOST: env.CAMOFOX_HOST,

@@ -60,6 +60,11 @@ Important behavior:
 
 ## 3) Mode Semantics (`headless` / `headed` / `virtual`)
 
+Platform boundary:
+- Windows x64 is supported in headless mode only.
+- `headless: false` and `headless: "virtual"` are rejected on Windows before Xvfb/VNC processes are started.
+- The Xvfb + x11vnc + websockify/noVNC stack below is Linux-only.
+
 - `headless: true`
   - no visible display
   - VNC is stopped for that user
@@ -103,6 +108,8 @@ This enables headed-style rendering in headless Linux environments.
 ---
 
 ## 6) Setup Requirements
+
+These requirements apply to Linux virtual-display/VNC deployments. They are not Windows dependencies.
 
 Required binaries for remote viewing:
 - `Xvfb` (virtual X server)

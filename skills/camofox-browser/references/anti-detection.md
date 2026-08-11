@@ -142,6 +142,8 @@ Supported values:
 - `false` => headed
 - `"virtual"` => virtual display mode
 
+Windows x64 support is headless-only. `false` and `"virtual"` are rejected before any Xvfb/VNC process is attempted. Native headed Windows mode is not part of the verified support contract.
+
 Linux fallback behavior:
 - If headed mode is requested and no usable display exists, Xvfb virtual display is spawned.
 

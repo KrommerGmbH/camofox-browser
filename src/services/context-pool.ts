@@ -1,4 +1,3 @@
-import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { type ChildProcess, spawn } from 'node:child_process';
@@ -14,6 +13,7 @@ import { type Fingerprint } from 'fingerprint-generator';
 import { firefox, type BrowserContext, type BrowserContextOptions } from 'playwright-core';
 
 import { loadConfig } from '../utils/config';
+import { assertBrowserPlatformSupported, getHostArchitecture, getHostOS } from '../utils/platform-support';
 import { readVersionedSidecar, writeVersionedSidecar } from '../utils/sidecar-version';
 import { log } from '../middleware/logging';
 import type { ResolvedProxyConfig } from '../types';
@@ -37,13 +37,6 @@ export interface PoolEntry {
 	virtualDisplay?: any;
 	proxyConfig?: ResolvedProxyConfig | null;
 	seedOptions?: Pick<BrowserContextOptions, 'locale' | 'timezoneId' | 'geolocation' | 'viewport'>;
-}
-
-function getHostOS(): 'macos' | 'windows' | 'linux' {
-	const platform = os.platform();
-	if (platform === 'darwin') return 'macos';
-	if (platform === 'win32') return 'windows';
-	return 'linux';
 }
 
 function buildProxyConfig(proxy?: ResolvedProxyConfig | null): { server: string; username?: string; password?: string } | null {
@@ -376,6 +369,7 @@ export class ContextPool {
 		const hostOS = getHostOS();
 		const proxy = buildProxyConfig(resolvedProxy);
 		const headless = this.headlessOverrides.get(userId) ?? CONFIG.headless;
+		assertBrowserPlatformSupported(hostOS, getHostArchitecture(), headless);
 
 		const profileDir = profileDirForProfileKey(profileKey);
 		fs.mkdirSync(profileDir, { recursive: true });
