@@ -43,10 +43,6 @@ const BUNDLE_NAME = `camofox-browser-${PACKAGE.version}-windows-x64`;
 const BUNDLE_DIR = join(OUTPUT_DIR, BUNDLE_NAME);
 const ZIP_PATH = join(OUTPUT_DIR, `${BUNDLE_NAME}.zip`);
 
-function commandForNpm() {
-  return process.platform === 'win32' ? 'npm.cmd' : 'npm';
-}
-
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd ?? ROOT,
@@ -64,6 +60,19 @@ function run(command, args, options = {}) {
     throw new Error(`${command} ${args.join(' ')} failed with exit code ${result.status}${details}`);
   }
   return result.stdout ?? '';
+}
+
+function runNpm(args, options = {}) {
+  const npmExecPath = process.env.npm_execpath;
+  if (npmExecPath) {
+    return run(process.execPath, [npmExecPath, ...args], options);
+  }
+
+  if (process.platform === 'win32') {
+    return run(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'npm', ...args], options);
+  }
+
+  return run('npm', args, options);
 }
 
 function assertWindowsX64Pe(filePath, label) {
@@ -236,7 +245,7 @@ async function main() {
   mkdirSync(CACHE_DIR, { recursive: true });
 
   console.log('=== Build application ===');
-  run(commandForNpm(), ['run', 'build']);
+  runNpm(['run', 'build']);
 
   const nodeArchivePath = join(CACHE_DIR, NODE_ARCHIVE);
   const camoufoxArchivePath = join(CACHE_DIR, CAMOUFOX_ARCHIVE);
@@ -258,8 +267,7 @@ async function main() {
 
   const appDir = join(BUNDLE_DIR, 'app');
   copyAppRuntime(appDir);
-  run(
-    commandForNpm(),
+  runNpm(
     [
       'ci',
       '--omit=dev',
@@ -270,8 +278,7 @@ async function main() {
       '--no-fund',
       '--os=win32',
       '--cpu=x64',
-    ],
-    {
+    ], {
       cwd: appDir,
       env: {
         ...process.env,
