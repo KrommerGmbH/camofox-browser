@@ -18,6 +18,7 @@
 
 ### Fixed
 - Windows now rejects headed and virtual/Xvfb/VNC display modes before Linux-only display processes can be attempted, while preserving existing Linux/macOS display behavior.
+- Windows persistent profile directories now use deterministic hashed internal keys, preventing distinct case-sensitive user/session identities from aliasing on case-insensitive Windows filesystems while leaving Linux/macOS profile naming unchanged.
 
 ### Tests
 - Added focused Windows platform and VNC side-effect regression tests plus a launcher test that removes Node from `PATH` and verifies the current runtime is reused.

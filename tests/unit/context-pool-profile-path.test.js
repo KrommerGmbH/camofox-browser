@@ -44,6 +44,21 @@ describe('context pool profile directory paths', () => {
     const userId = 'visitor';
     const defaultProfileKey = `u:${encodeKeyComponent(userId)}`;
 
-    expect(path.basename(profileDirForProfileKey(PROFILES_DIR, defaultProfileKey))).toBe(userId);
+    expect(path.basename(profileDirForProfileKey(PROFILES_DIR, defaultProfileKey, 'linux'))).toBe(userId);
+  });
+
+  test('hashes default-user profile keys on Windows so case-insensitive names cannot alias', () => {
+    const upperKey = `u:${encodeKeyComponent('Alice')}`;
+    const lowerKey = `u:${encodeKeyComponent('alice')}`;
+    const dottedKey = `u:${encodeKeyComponent('alice.')}`;
+
+    const upperDir = path.basename(profileDirForProfileKey(PROFILES_DIR, upperKey, 'win32'));
+    const lowerDir = path.basename(profileDirForProfileKey(PROFILES_DIR, lowerKey, 'win32'));
+    const dottedDir = path.basename(profileDirForProfileKey(PROFILES_DIR, dottedKey, 'win32'));
+
+    expect(upperDir).toMatch(/^profile-[0-9a-f]{64}$/);
+    expect(lowerDir).toMatch(/^profile-[0-9a-f]{64}$/);
+    expect(dottedDir).toMatch(/^profile-[0-9a-f]{64}$/);
+    expect(new Set([upperDir, lowerDir, dottedDir]).size).toBe(3);
   });
 });

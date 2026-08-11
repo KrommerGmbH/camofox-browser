@@ -39,10 +39,10 @@ export function profileDirForProfileKey(
 	const normalized = String(profileKey);
 	const defaultUserId = decodeDefaultProfileUserId(normalized);
 	const isInternalProfileKey = /^(?:u|s|p|o):/.test(normalized);
-	const basename = defaultUserId !== null
-		? encodeURIComponent(defaultUserId)
-		: isInternalProfileKey && platform === 'win32'
-			? internalProfileDirectoryName(normalized)
+	const basename = isInternalProfileKey && platform === 'win32'
+		? internalProfileDirectoryName(normalized)
+		: defaultUserId !== null
+			? encodeURIComponent(defaultUserId)
 			: encodeURIComponent(normalized);
 	return path.join(profilesDir, basename);
 }

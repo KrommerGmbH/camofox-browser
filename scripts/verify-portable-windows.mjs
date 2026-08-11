@@ -82,6 +82,12 @@ function sha256Buffer(buffer) {
   return createHash('sha256').update(buffer).digest('hex');
 }
 
+function windowsDefaultProfileDirectoryName(userId) {
+  const encodedUserId = Buffer.from(String(userId), 'utf16le').toString('base64url');
+  const profileKey = `u:${encodedUserId}`;
+  return `profile-${createHash('sha256').update(profileKey, 'utf8').digest('hex')}`;
+}
+
 function snapshotTree(root) {
   if (!existsSync(root)) return [];
   const entries = [];
@@ -244,7 +250,11 @@ try {
   await waitUntilStopped(`${baseUrl}/health`);
 
   const portableStateDir = join(portableHome, '.camofox');
-  const portableProfileDir = join(portableStateDir, 'profiles', userId);
+  const portableProfileDir = join(
+    portableStateDir,
+    'profiles',
+    windowsDefaultProfileDirectoryName(userId),
+  );
   const portableServerLog = join(portableStateDir, 'logs', 'server.log');
   const camoufoxExe = join(
     portableHome,
