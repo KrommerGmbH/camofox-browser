@@ -1,9 +1,10 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { assertDisposableTestRoot } = require('./test-state-root');
 
 module.exports = async function globalTestStateSetup() {
-  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-jest-state-'));
+  const stateRoot = assertDisposableTestRoot(fs.mkdtempSync(path.join(os.tmpdir(), 'camofox-jest-state-')));
   const stateDirs = {
     CAMOFOX_PROFILES_DIR: path.join(stateRoot, 'profiles'),
     CAMOFOX_COOKIES_DIR: path.join(stateRoot, 'cookies'),
