@@ -144,6 +144,8 @@ Extract the ZIP to a writable directory and run the bundled launchers from Power
 
 Portable runtime state stays under `data\home` inside the extracted directory. This includes camofox-browser's `.camofox` profiles/logs and the bundled Camoufox cache, so the portable distribution does not use the normal Windows user profile for its application state.
 
+The portable ZIP intentionally excludes Camoufox's upstream bundled `fonts/` directory because the exact upstream source explicitly does not permit redistribution of those copyrighted Windows/macOS fonts. On Windows, CamoFox uses fonts installed on the host system instead.
+
 The supported Windows x64 display contract is `headless=true`. `headless=false` and `headless="virtual"` are rejected with a clear error before any Linux-only display process is attempted. Xvfb/VNC virtual display mode remains Linux-only, and native headed Windows mode is not part of the verified support contract.
 
 The release workflow verifies the ZIP after extracting it into a path containing spaces, starts the CLI using bundled Node.js with global Node removed from `PATH`, checks `/health`, runs a local create → navigate → snapshot → close browser flow, and confirms server shutdown and portable-state placement.

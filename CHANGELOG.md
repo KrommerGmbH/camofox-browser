@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.4.7] - 2026-08-11
+
 ### Added
 - Added official Windows x64 headless support and a reproducible portable ZIP build that bundles Node.js, the application runtime, the pinned Camoufox Windows x64 engine, portable runtime state under `data\home`, and third-party licensing notices.
 - Added Windows Node 20/22 CI plus a Windows x64 portable-artifact job that extracts into a path containing spaces and verifies bundled-runtime CLI startup, `/health`, a safe local create/navigate/snapshot/close browser flow, server shutdown, and portable-state placement.

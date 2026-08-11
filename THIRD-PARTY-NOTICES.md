@@ -14,7 +14,9 @@ The portable Windows distribution redistributes the following runtime components
 - Project: https://github.com/daijro/camoufox
 - Source: https://github.com/daijro/camoufox/tree/v152.0.4-beta.28
 - License: Mozilla Public License 2.0 (MPL-2.0).
-- The portable bundle redistributes the unmodified Windows x64 release archive contents.
+- The portable bundle redistributes the Windows x64 browser/runtime from the exact upstream release, with the upstream `fonts/` directory deliberately removed.
+- The exact upstream tag states that its Windows/macOS bundled fonts are copyrighted and are not intended or permitted for redistribution. Those fonts are therefore not included in this portable distribution; Windows uses the fonts installed on the host system.
+- The exact Camoufox MPL-2.0 text is retained at `licenses/Camoufox-MPL-2.0.txt`, and the corresponding source is available from the exact source tag above.
 
 ## camoufox-js 0.8.5
 
@@ -31,7 +33,7 @@ The portable Windows distribution redistributes the following runtime components
 - The Windows x64 native package is required by `impit`, a runtime dependency of `camoufox-js`.
 - A copy of the Apache License 2.0 is retained in the portable bundle at `licenses/Apache-2.0.txt`.
 
-The Mozilla Public License 2.0 text used by Camoufox/camoufox-js is retained at `licenses/MPL-2.0.txt`. The redistributed Camoufox executable is the unmodified upstream `v152.0.4-beta.28` Windows x64 release; its corresponding source code is available from the exact upstream source tag linked above.
+The Mozilla Public License 2.0 text used by `camoufox-js` is retained at `licenses/MPL-2.0.txt`. The Camoufox executable and browser runtime correspond to upstream `v152.0.4-beta.28`, except for the excluded `fonts/` payload described above.
 
 ## Other npm runtime dependencies
 

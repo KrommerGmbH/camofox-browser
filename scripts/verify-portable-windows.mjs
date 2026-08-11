@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import http from 'node:http';
 import { createRequire } from 'node:module';
 import net from 'node:net';
@@ -36,6 +37,10 @@ const betterSqliteNativeBinary = join(
 );
 const mplLicense = join(bundleRoot, 'licenses', 'MPL-2.0.txt');
 const apacheLicense = join(bundleRoot, 'licenses', 'Apache-2.0.txt');
+const camoufoxLicense = join(bundleRoot, 'licenses', 'Camoufox-MPL-2.0.txt');
+const portableHome = join(bundleRoot, 'data', 'home');
+const bundledCamoufoxDir = join(portableHome, 'AppData', 'Local', 'camoufox', 'camoufox', 'Cache');
+const bundledFontsDir = join(bundledCamoufoxDir, 'fonts');
 
 if (!existsSync(bundledNode) || !existsSync(cliPath)) {
   throw new Error('Portable bundle is missing the bundled Node runtime or camofox.cmd launcher');
@@ -46,8 +51,11 @@ if (!existsSync(impitNativeBinary)) {
 if (!existsSync(betterSqliteNativeBinary)) {
   throw new Error('Portable bundle is missing better-sqlite3 Windows x64 native runtime support');
 }
-if (!existsSync(mplLicense) || !existsSync(apacheLicense)) {
+if (!existsSync(mplLicense) || !existsSync(apacheLicense) || !existsSync(camoufoxLicense)) {
   throw new Error('Portable bundle is missing required third-party license texts');
+}
+if (existsSync(bundledFontsDir)) {
+  throw new Error('Portable bundle must not redistribute the upstream Camoufox fonts directory');
 }
 if (realpathSync.native(process.execPath).toLowerCase() !== realpathSync.native(bundledNode).toLowerCase()) {
   throw new Error(`Verification is not running on bundled Node: ${process.execPath}`);
@@ -66,7 +74,32 @@ function portableEnvironment(extra = {}) {
   env.CAMOFOX_AUTH_MODE = 'disabled';
   env.CAMOFOX_HEADLESS = 'true';
   env.CAMOFOX_HOST = '127.0.0.1';
+  env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = '1';
   return { ...env, ...extra };
+}
+
+function sha256Buffer(buffer) {
+  return createHash('sha256').update(buffer).digest('hex');
+}
+
+function snapshotTree(root) {
+  if (!existsSync(root)) return [];
+  const entries = [];
+  const visit = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const fullPath = join(directory, entry.name);
+      const relativePath = fullPath.slice(root.length + 1).split('\\').join('/');
+      if (entry.isDirectory()) {
+        entries.push(`d:${relativePath}`);
+        visit(fullPath);
+      } else if (entry.isFile()) {
+        const stat = statSync(fullPath);
+        entries.push(`f:${relativePath}:${stat.size}:${sha256Buffer(readFileSync(fullPath))}`);
+      }
+    }
+  };
+  visit(root);
+  return entries;
 }
 
 function runCli(args, env, { allowFailure = false } = {}) {
@@ -140,6 +173,16 @@ await new Promise((resolvePromise, reject) => {
 const env = portableEnvironment({ PORT: String(serverPort) });
 const baseUrl = `http://127.0.0.1:${serverPort}`;
 let daemonStarted = false;
+const externalHome = process.env.USERPROFILE ? resolve(process.env.USERPROFILE) : '';
+if (!externalHome) throw new Error('Windows USERPROFILE is required for portable-state escape verification');
+if (externalHome.toLowerCase() === portableHome.toLowerCase()) {
+  throw new Error('Portable-state verification requires an external runner profile distinct from the bundle data directory');
+}
+const externalStateRoots = [
+  join(externalHome, '.camofox'),
+  join(externalHome, 'AppData', 'Local', 'camoufox'),
+];
+const externalStateBefore = externalStateRoots.map((root) => snapshotTree(root));
 
 try {
   const requireFromApp = createRequire(join(bundleRoot, 'app', 'package.json'));
@@ -200,11 +243,11 @@ try {
   daemonStarted = false;
   await waitUntilStopped(`${baseUrl}/health`);
 
-  const portableStateDir = join(bundleRoot, 'data', 'home', '.camofox');
+  const portableStateDir = join(portableHome, '.camofox');
+  const portableProfileDir = join(portableStateDir, 'profiles', userId);
+  const portableServerLog = join(portableStateDir, 'logs', 'server.log');
   const camoufoxExe = join(
-    bundleRoot,
-    'data',
-    'home',
+    portableHome,
     'AppData',
     'Local',
     'camoufox',
@@ -212,8 +255,12 @@ try {
     'Cache',
     'camoufox.exe',
   );
-  if (!existsSync(portableStateDir) || !existsSync(camoufoxExe)) {
+  if (!existsSync(portableStateDir) || !existsSync(portableProfileDir) || !existsSync(portableServerLog) || !existsSync(camoufoxExe)) {
     throw new Error('Portable state or bundled Camoufox engine escaped the expected data directory');
+  }
+  const externalStateAfter = externalStateRoots.map((root) => snapshotTree(root));
+  if (JSON.stringify(externalStateAfter) !== JSON.stringify(externalStateBefore)) {
+    throw new Error('Portable smoke modified Camoufox state outside the bundle data directory');
   }
 
   console.log(`PASS bundled Node: ${process.execPath}`);
@@ -222,7 +269,7 @@ try {
   console.log(`PASS CLI version: ${packageJson.version}`);
   console.log(`PASS health: ${baseUrl}/health`);
   console.log('PASS local browser flow: create -> navigate -> snapshot -> close');
-  console.log('PASS server stop and portable data directory');
+  console.log('PASS server stop, portable profile/log placement, and no external state mutation');
 } finally {
   if (daemonStarted) runCli(['server', 'stop'], env, { allowFailure: true });
   await new Promise((resolvePromise) => localPageServer.close(resolvePromise));

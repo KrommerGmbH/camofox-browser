@@ -33,6 +33,8 @@ const CAMOUFOX_TAG = `v${CAMOUFOX_VERSION}-${CAMOUFOX_RELEASE}`;
 const CAMOUFOX_ARCHIVE = `camoufox-${CAMOUFOX_VERSION}-${CAMOUFOX_RELEASE}-win.x86_64.zip`;
 const CAMOUFOX_URL = `https://github.com/daijro/camoufox/releases/download/${CAMOUFOX_TAG}/${CAMOUFOX_ARCHIVE}`;
 const CAMOUFOX_SHA256 = '386fc2f41139685f9a1a9cef0d024bc041d899c315ea538d561171b5b282e57d';
+const CAMOUFOX_LICENSE_URL = `https://raw.githubusercontent.com/daijro/camoufox/${CAMOUFOX_TAG}/LICENSE`;
+const CAMOUFOX_LICENSE_SHA256 = '1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5';
 
 const APACHE_LICENSE_URL = 'https://www.apache.org/licenses/LICENSE-2.0.txt';
 const APACHE_LICENSE_SHA256 = 'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30';
@@ -333,9 +335,23 @@ async function main() {
   await downloadPinned(APACHE_LICENSE_URL, apacheLicenseCache, APACHE_LICENSE_SHA256);
   cpSync(apacheLicenseCache, join(licensesDir, 'Apache-2.0.txt'));
 
+  const camoufoxLicenseCache = join(CACHE_DIR, 'Camoufox-MPL-2.0.txt');
+  await downloadPinned(CAMOUFOX_LICENSE_URL, camoufoxLicenseCache, CAMOUFOX_LICENSE_SHA256);
+  cpSync(camoufoxLicenseCache, join(licensesDir, 'Camoufox-MPL-2.0.txt'));
+
   const portableHome = join(BUNDLE_DIR, 'data', 'home');
   const browserDir = join(portableHome, 'AppData', 'Local', 'camoufox', 'camoufox', 'Cache');
   extractZip(camoufoxArchivePath, browserDir);
+  const upstreamFontsDir = join(browserDir, 'fonts');
+  if (existsSync(upstreamFontsDir)) {
+    // The exact upstream tag states that bundled Windows/macOS fonts are
+    // copyrighted and are not intended or permitted for redistribution.
+    // A portable Windows build uses the host's installed fonts instead.
+    rmSync(upstreamFontsDir, { recursive: true, force: true });
+  }
+  if (existsSync(upstreamFontsDir)) {
+    throw new Error('Portable bundle still contains upstream fonts that are not approved for redistribution');
+  }
   writeFileSync(
     join(browserDir, 'version.json'),
     `${JSON.stringify({ version: CAMOUFOX_VERSION, release: CAMOUFOX_RELEASE })}\n`,
@@ -356,6 +372,7 @@ async function main() {
       '',
       'Runtime state is kept below data\\home, including .camofox profiles/logs and the bundled Camoufox cache.',
       'The verified Windows contract is headless-only. Headed and virtual/Xvfb/VNC modes are unsupported.',
+      'The upstream Camoufox fonts directory is intentionally excluded; the portable Windows build uses host-installed Windows fonts.',
       '',
       'Third-party licensing information is available in app\\THIRD-PARTY-NOTICES.md, licenses\\, and bundled component license files.',
       '',
