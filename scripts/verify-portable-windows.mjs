@@ -79,6 +79,7 @@ function runCli(args, env, { allowFailure = false } = {}) {
     env,
     encoding: 'utf8',
     timeout: 90_000,
+    windowsVerbatimArguments: true,
   });
   if (!allowFailure && (result.error || result.status !== 0)) {
     throw new Error(

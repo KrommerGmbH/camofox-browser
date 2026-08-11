@@ -11,4 +11,13 @@ describe('Windows portable build process invocation', () => {
     expect(script).toContain('process.env.npm_execpath');
     expect(script).not.toContain("process.platform === 'win32' ? 'npm.cmd' : 'npm'");
   });
+
+  test('passes the cmd launcher command line verbatim for paths containing spaces', () => {
+    const verifier = fs.readFileSync(
+      path.join(__dirname, '../../scripts/verify-portable-windows.mjs'),
+      'utf8',
+    );
+
+    expect(verifier).toContain('windowsVerbatimArguments: true');
+  });
 });
