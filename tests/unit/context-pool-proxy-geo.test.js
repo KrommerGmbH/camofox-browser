@@ -190,7 +190,7 @@ describe('ContextPool proxy-geo identity', () => {
     const userId = 'toggle::owner';
     const profileKey = defaultProfileKey(userId);
 
-    const restarted = await pool.restartContext(userId, false, profileKey);
+    const restarted = await pool.restartContext(userId, true, profileKey);
 
     expect(restarted.profileKey).toBe(profileKey);
     expect(pool.getEntry(profileKey)).toBe(restarted);
