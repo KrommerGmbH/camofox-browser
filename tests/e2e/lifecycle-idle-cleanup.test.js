@@ -208,7 +208,7 @@ describe('Lifecycle idle cleanup (Stage 1)', () => {
       body: JSON.stringify({
         userId,
         sessionKey,
-        url: 'https://example.com',
+        url: `${testSiteUrl}/pageA`,
       }),
     });
     expect(createTab1.status).toBe(200);
@@ -234,7 +234,7 @@ describe('Lifecycle idle cleanup (Stage 1)', () => {
       body: JSON.stringify({
         userId,
         sessionKey,
-        url: 'https://example.com/page2',
+        url: `${testSiteUrl}/pageB`,
       }),
     });
     expect(createTab2.status).toBe(200);
@@ -249,7 +249,7 @@ describe('Lifecycle idle cleanup (Stage 1)', () => {
       body: JSON.stringify({
         userId,
         sessionKey,
-        url: 'https://example.com/working',
+        url: `${testSiteUrl}/pageA`,
       }),
     });
     expect(navigate.status).toBe(200);

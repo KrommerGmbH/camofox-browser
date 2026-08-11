@@ -3,12 +3,16 @@
  * Verifies that ensureContext reuses contexts only when profileKey matches.
  */
 
+const path = require('node:path');
+
+const MOCK_PROFILES_DIR = path.resolve(path.sep, 'tmp', 'camofox-test', 'profiles');
+
 // Mock config FIRST to set small maxSessions for eviction testing
 jest.mock('../../dist/src/utils/config', () => ({
   loadConfig: jest.fn(() => ({
     maxSessions: 2, // Force small pool for eviction tests
     userDataDir: '/tmp/camofox-test',
-    profilesDir: '/tmp/camofox-test/profiles',
+    profilesDir: MOCK_PROFILES_DIR,
     port: 3000,
     fingerprintDefaults: {},
     proxy: {
@@ -45,6 +49,11 @@ const mockLaunchPersistentContext = jest.fn(async () => {
 
 function defaultProfileKey(userId) {
   return `u:${Buffer.from(String(userId), 'utf16le').toString('base64url')}`;
+}
+
+function expectedProfileDir(profileKey) {
+  const { profileDirForProfileKey } = require('../../dist/src/utils/profile-path');
+  return profileDirForProfileKey(MOCK_PROFILES_DIR, profileKey);
 }
 
 // Mock playwright-core to avoid heavy browser dependencies
@@ -167,8 +176,8 @@ describe('ContextPool proxy-geo identity', () => {
     );
 
     const dirs = mockLaunchPersistentContext.mock.calls.map((call) => call[0]);
-    expect(dirs).toContain('/tmp/camofox-test/profiles/user-6%3A%3Aalpha%3A%3Asig-a');
-    expect(dirs).toContain('/tmp/camofox-test/profiles/user-6%3A%3Abeta%3A%3Asig-b');
+    expect(dirs).toContain(expectedProfileDir('user-6::alpha::sig-a'));
+    expect(dirs).toContain(expectedProfileDir('user-6::beta::sig-b'));
     expect(new Set(dirs).size).toBe(2);
 
     await pool.closeContext('user-6::alpha::sig-a');
@@ -196,9 +205,9 @@ describe('ContextPool proxy-geo identity', () => {
 
     const entry = await pool.ensureContext(profileKey, userId);
 
-    expect(entry.profileDir).toBe('/tmp/camofox-test/profiles/legacy%3A%3Aowner');
+    expect(entry.profileDir).toBe(expectedProfileDir(profileKey));
     expect(mockLaunchPersistentContext).toHaveBeenCalledWith(
-      '/tmp/camofox-test/profiles/legacy%3A%3Aowner',
+      expectedProfileDir(profileKey),
       expect.any(Object),
     );
 
@@ -213,8 +222,8 @@ describe('ContextPool proxy-geo identity', () => {
     const victim = await pool.ensureContext(craftedUserId, 'victim', { timezoneId: 'Asia/Tokyo' });
     const crafted = await pool.ensureContext(craftedDefaultKey, craftedUserId);
 
-    expect(victim.profileDir).toBe('/tmp/camofox-test/profiles/p%3AdmljdGlt%3AYWxwaGE%3AN2Y0OTBlN2M2ODBk');
-    expect(crafted.profileDir).toBe(`/tmp/camofox-test/profiles/${encodeURIComponent(craftedDefaultKey)}`);
+    expect(victim.profileDir).toBe(expectedProfileDir(craftedUserId));
+    expect(crafted.profileDir).toBe(expectedProfileDir(craftedDefaultKey));
     expect(crafted.profileDir).not.toBe(victim.profileDir);
 
     await pool.closeContext(craftedDefaultKey);
@@ -232,8 +241,8 @@ describe('ContextPool proxy-geo identity', () => {
     const lone = await pool.ensureContext(loneKey, loneSurrogateUserId);
     const replacement = await pool.ensureContext(replacementKey, replacementUserId);
 
-    expect(lone.profileDir).toBe(`/tmp/camofox-test/profiles/${encodeURIComponent(loneKey)}`);
-    expect(replacement.profileDir).toBe('/tmp/camofox-test/profiles/%EF%BF%BD');
+    expect(lone.profileDir).toBe(expectedProfileDir(loneKey));
+    expect(replacement.profileDir).toBe(expectedProfileDir(replacementKey));
     expect(lone.profileDir).not.toBe(replacement.profileDir);
 
     await pool.closeContext(loneKey);
