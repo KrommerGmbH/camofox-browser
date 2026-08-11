@@ -34,10 +34,6 @@ const fail = (message) => {
   console.error(`FAIL: ${message}`);
 };
 
-function npmCommand() {
-  return process.platform === 'win32' ? 'npm.cmd' : 'npm';
-}
-
 function run(command, args, { cwd = ROOT, capture = false } = {}) {
   const result = spawnSync(command, args, {
     cwd,
@@ -53,6 +49,19 @@ function run(command, args, { cwd = ROOT, capture = false } = {}) {
     );
   }
   return result.stdout ?? '';
+}
+
+function runNpm(args, options = {}) {
+  const npmExecPath = process.env.npm_execpath;
+  if (npmExecPath) {
+    return run(process.execPath, [npmExecPath, ...args], options);
+  }
+
+  if (process.platform === 'win32') {
+    return run(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'npm', ...args], options);
+  }
+
+  return run('npm', args, options);
 }
 
 function runInstalledBin(binPath, cwd) {
@@ -72,10 +81,10 @@ try {
   console.log('=== CamoFox Package Contract Verification ===\n');
 
   console.log('--- Step 1: Build ---');
-  run(npmCommand(), ['run', 'build']);
+  runNpm(['run', 'build']);
 
   console.log('\n--- Step 2: Pack ---');
-  const packJson = run(npmCommand(), ['pack', '--json', '--pack-destination', tempRoot], { capture: true });
+  const packJson = runNpm(['pack', '--json', '--pack-destination', tempRoot], { capture: true });
   const packResult = JSON.parse(packJson);
   const packed = packResult[0];
   if (!packed?.filename) throw new Error('npm pack did not report a tarball filename');
@@ -101,8 +110,7 @@ try {
 
   console.log('\n--- Step 4: Clean Install + Manifest Metadata ---');
   writeFileSync(join(tempRoot, 'package.json'), '{"private":true}\n', 'utf8');
-  run(
-    npmCommand(),
+  runNpm(
     ['install', tarballPath, '--ignore-scripts', '--omit=optional', '--no-audit', '--no-fund'],
     { cwd: tempRoot },
   );
