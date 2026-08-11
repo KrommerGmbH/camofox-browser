@@ -637,15 +637,40 @@ export class ContextPool {
 			// await, the generation check below will NOT close the newer
 			// healthy context.
 			const entry = this.pool.get(normalizedProfile);
-			const ownerMatches = entry && entry.userId === normalizedUser && !entry.staged;
-			const generation = ownerMatches ? entry.createdAt : undefined;
+
+			// HIGH A — Foreign owner: the pool entry exists but is owned by
+			// a different user. This is a fail-closed no-op. A foreign key
+			// must never tear down another user's session/context.
+			if (entry && entry.userId !== normalizedUser) {
+				log('warn', 'closeContextBySession: foreign owner, no-op', {
+					requestedUser: normalizedUser,
+					actualOwner: entry.userId,
+					profileKey: normalizedProfile,
+				});
+				return;
+			}
+
+			// Staged entries are not eligible for recovery teardown.
+			if (entry && entry.staged) {
+				log('warn', 'closeContextBySession: staged entry, no-op', {
+					profileKey: normalizedProfile,
+				});
+				return;
+			}
+
+			// If the pool entry exists and the owner matches, capture the
+			// generation timestamp for safe teardown.
+			// If the pool entry is missing, generation is undefined — meaning
+			// "clean stale session/tab index records only; do NOT close any
+			// context, because a new context may have appeared during the
+			// await and must not be destroyed" (HIGH B).
+			const generation = entry ? entry.createdAt : undefined;
 
 			// Full session teardown: unindex tabs, delete session entry,
-			// AND close the backing context. This runs even when the pool
-			// entry is missing — an unexpected context close may have
-			// already removed the pool entry, but the session/tab records
-			// in session.ts are still indexed and must be cleaned up so
-			// findTabById stops returning stale Page objects.
+			// AND close the backing context (only when generation is known).
+			// When the pool entry is missing, session/tab records are still
+			// cleaned up so findTabById stops returning stale Page objects,
+			// but no context close is attempted (HIGH B).
 			//
 			// Lazy import to avoid circular dependency with session.ts.
 			const { teardownSessionByKey } = await import('./session');

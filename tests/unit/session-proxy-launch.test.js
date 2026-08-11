@@ -53,6 +53,7 @@ jest.mock('../../dist/src/services/download', () => ({
 jest.mock('../../dist/src/services/health', () => ({
   decrementActiveOps: jest.fn(),
   incrementActiveOps: jest.fn(),
+  deleteUserHealth: jest.fn(),
 }));
 
 jest.mock('../../dist/src/services/tab', () => ({

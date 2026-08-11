@@ -629,13 +629,25 @@ export async function rollbackSessionProfileRuntime(
  * Sibling sessions for the same user are preserved — only the exact
  * sessionMapKey is torn down.
  *
- * Generation safety: when `expectedCreatedAt` is provided, the context
- * is only closed if the pool entry's `createdAt` matches. This prevents
- * the replacement race where a new pool entry with the same key appears
- * during the await between the ownership check and the actual close.
- * When `expectedCreatedAt` is undefined (no pool entry existed, or stale
- * key), the context close is still attempted via `closeContextIfMatches`
- * which will no-op if no entry exists.
+ * Generation safety (HIGH B + HIGH C):
+ * - When `expectedCreatedAt` is provided (pool entry existed and owner
+ *   matched), the context is closed only if the pool entry's `createdAt`
+ *   still matches. This prevents closing a replacement context that
+ *   appeared during the await.
+ * - When `expectedCreatedAt` is undefined (pool entry was missing at
+ *   snapshot), stale session/tab records are cleaned up, but NO context
+ *   close is attempted. A new context may have appeared during the await
+ *   and must not be destroyed.
+ *
+ * Session record safety (HIGH C): the session's `createdAt` is captured
+ * before any await. After the await, the session is only deleted if its
+ * `createdAt` still matches — preventing deletion of a replacement
+ * session that reused the same key.
+ *
+ * Recovery lock safety (HIGH D): deleteUserHealth is NOT called here.
+ * Lock/health eviction is owned by handleNavFailure's finally block and
+ * by ordinary session lifecycle paths (cleanupSessionsForUserId,
+ * closeAllSessions, startCleanupInterval).
  *
  * Returns true if a session was found and torn down, false otherwise.
  */
@@ -644,26 +656,46 @@ export async function teardownSessionByKey(sessionMapKey: string, expectedCreate
 	const session = sessions.get(normalized);
 	if (!session) return false;
 
-	unindexSessionTabs(session);
+	// Capture the session's generation before any await (HIGH C).
+	// After the context close await, we re-check that the session record
+	// is still the same one we started with. If a replacement session
+	// appeared during the await, we leave it untouched.
+	const sessionCreatedAt = session.createdAt;
+
+	// Use generation-aware close to prevent the replacement race (HIGH B).
+	// When expectedCreatedAt is provided (pool entry existed), only close
+	// the context if the pool entry's createdAt still matches.
+	// When expectedCreatedAt is undefined (pool entry was missing at
+	// snapshot), do NOT close any context — a new context may have
+	// appeared during the await and must not be destroyed.
+	if (expectedCreatedAt !== undefined) {
+		await contextPool.closeContextIfMatches(normalized, expectedCreatedAt).catch(() => {});
+	}
+	// else: no pool entry at snapshot time → index cleanup only, no close.
+
+	// Re-check session identity after the await (HIGH C).
+	// If a replacement session replaced the old one during the await,
+	// leave it intact and only clean up the old session's tab index.
+	const currentSession = sessions.get(normalized);
+	if (!currentSession || currentSession.createdAt !== sessionCreatedAt) {
+		// The session was replaced during the await. Unindex the old
+		// session's tabs (captured above) but do not delete the new
+		// session record or its owner mappings.
+		unindexSessionTabs(session);
+		log('warn', 'teardownSessionByKey: session replaced during await, leaving new session intact', {
+			sessionMapKey: normalized,
+			oldCreatedAt: sessionCreatedAt,
+			newCreatedAt: currentSession?.createdAt,
+		});
+		return true;
+	}
+
+	// Same session — safe to delete session records.
+	unindexSessionTabs(currentSession);
 	sessions.delete(normalized);
-	const ownerUserId = sessionOwners.get(normalized);
 	sessionOwners.delete(normalized);
 	launchingSessions.delete(normalized);
 	launchingSessionOwners.delete(normalized);
-	// Evict per-session health entry so the map doesn't grow unbounded.
-	// nav-recovery.ts also calls deleteUserHealth in its finally block,
-	// but teardownSessionByKey is also called from other paths.
-	deleteUserHealth(ownerUserId ?? normalized, normalized);
-
-	// Use generation-aware close to prevent the replacement race.
-	// If expectedCreatedAt is undefined (missing pool entry), this
-	// still cleans up the session/tab records above; the context
-	// close will no-op if no pool entry exists.
-	if (expectedCreatedAt !== undefined) {
-		await contextPool.closeContextIfMatches(normalized, expectedCreatedAt).catch(() => {});
-	} else {
-		await contextPool.closeContext(normalized).catch(() => {});
-	}
 
 	log('info', 'session torn down by key (nav recovery)', { sessionMapKey: normalized, expectedCreatedAt });
 	return true;
@@ -827,6 +859,7 @@ export async function createStagedSession(
 		context: entry.context,
 		tabGroups: new Map(),
 		lastAccess: Date.now(),
+		createdAt: Date.now(),
 	};
 
 	return { session, contextEntry: entry, generation };
@@ -911,7 +944,7 @@ export async function getSession(
 				contextOptions,
 				runtimeProfile.resolvedProxy,
 			);
-			const created: SessionData = { context: entry.context, tabGroups: new Map(), lastAccess: Date.now() };
+			const created: SessionData = { context: entry.context, tabGroups: new Map(), lastAccess: Date.now(), createdAt: Date.now() };
 			sessions.set(runtimeProfile.sessionMapKey, created);
 			sessionOwners.set(runtimeProfile.sessionMapKey, key);
 			log('info', 'session created', { userId: key, sessionMapKey: runtimeProfile.sessionMapKey });
