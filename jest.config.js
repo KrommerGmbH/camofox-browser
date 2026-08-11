@@ -28,8 +28,9 @@ module.exports = {
   // Verbose output
   verbose: true,
   
-  // Fail fast on first error (useful for CI)
-  bail: process.env.CI ? 1 : 0,
+  // Always run the complete suite so CI produces full cross-platform evidence
+  // instead of hiding later failures behind the first red suite.
+  bail: 0,
   
   // Coverage settings (optional)
   collectCoverage: false,
