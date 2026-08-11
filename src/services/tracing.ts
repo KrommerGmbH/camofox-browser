@@ -1,6 +1,6 @@
 import { mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import type { BrowserContext } from 'playwright-core';
 import { loadConfig } from '../utils/config';
@@ -85,8 +85,8 @@ function ensureOutputDir(path: string): void {
 function resolveAndValidateOutputPath(outputPath: string): string {
 	const tracesDir = getTracesDir();
 	const resolvedPath = resolve(outputPath);
-	const normalizedTracesDir = tracesDir.endsWith('/') ? tracesDir : `${tracesDir}/`;
-	if (!resolvedPath.startsWith(normalizedTracesDir) && resolvedPath !== tracesDir) {
+	const relativePath = relative(tracesDir, resolvedPath);
+	if (relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
 		throw new Error('Invalid trace output path: must be within traces directory');
 	}
 	return resolvedPath;
