@@ -109,7 +109,7 @@ async function getWindowsServerResourceSummary() {
   if (!pid) return null;
   const command = [
     `$p = Get-Process -Id ${pid} -ErrorAction Stop;`,
-    '[Console]::WriteLine("handles={0};workingSet={1};private={2}" -f $p.Handles,$p.WorkingSet64,$p.PrivateMemorySize64)',
+    '$p | Select-Object Id,Handles,WorkingSet64,PrivateMemorySize64 | ConvertTo-Json -Compress',
   ].join(' ');
   const { stdout = '' } = await execFileAsync('powershell.exe', [
     '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command,
@@ -144,9 +144,6 @@ describe('Session invariants', () => {
     if (leakedProcessIds.length > 0) {
       throw new Error(`Camoufox processes remained after pool cleanup: ${leakedProcessIds.join(',')}`);
     }
-    if (process.platform === 'win32') {
-      console.log(`windows-resource-after:${expect.getState().currentTestName}:${await getWindowsServerResourceSummary()}`);
-    }
     resetTestStateDirectories([
       'CAMOFOX_PROFILES_DIR',
       'CAMOFOX_COOKIES_DIR',
@@ -154,6 +151,9 @@ describe('Session invariants', () => {
       'CAMOFOX_TRACES_DIR',
     ]);
     cleanupUsers.clear();
+    if (process.platform === 'win32') {
+      console.log(`windows-resource-after:${expect.getState().currentTestName}:${await getWindowsServerResourceSummary()}`);
+    }
   });
 
   afterAll(async () => {
