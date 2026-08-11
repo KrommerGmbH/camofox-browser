@@ -91,12 +91,13 @@ async function getWindowsCamoufoxProcessIds() {
     .filter(Number.isFinite);
 }
 
-async function waitForNoWindowsCamoufoxProcesses(timeoutMs = 10000) {
+async function waitForNoNewWindowsCamoufoxProcesses(baselineProcessIds, timeoutMs = 10000) {
   if (process.platform !== 'win32') return [];
   const deadline = Date.now() + timeoutMs;
   let processIds = [];
   while (Date.now() < deadline) {
-    processIds = await getWindowsCamoufoxProcessIds();
+    processIds = (await getWindowsCamoufoxProcessIds())
+      .filter((processId) => !baselineProcessIds.has(processId));
     if (processIds.length === 0) return processIds;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
@@ -120,6 +121,7 @@ async function getWindowsServerResourceSummary() {
 describe('Session invariants', () => {
   let serverUrl;
   let testSiteUrl;
+  let baselineWindowsCamoufoxProcessIds = new Set();
   const cleanupUsers = new Set();
 
   function trackUser(prefix) {
@@ -129,6 +131,7 @@ describe('Session invariants', () => {
   }
 
   beforeAll(async () => {
+    baselineWindowsCamoufoxProcessIds = new Set(await getWindowsCamoufoxProcessIds());
     await startServer(0, { CAMOFOX_MAX_SESSIONS: '1', CAMOFOX_API_KEY: '' });
     serverUrl = getServerUrl();
     await startTestSite();
@@ -140,7 +143,7 @@ describe('Session invariants', () => {
       await deleteSession(serverUrl, userId).catch(() => {});
     }
     await waitForPoolSize(serverUrl, 0, 15000);
-    const leakedProcessIds = await waitForNoWindowsCamoufoxProcesses();
+    const leakedProcessIds = await waitForNoNewWindowsCamoufoxProcesses(baselineWindowsCamoufoxProcessIds);
     if (leakedProcessIds.length > 0) {
       throw new Error(`Camoufox processes remained after pool cleanup: ${leakedProcessIds.join(',')}`);
     }
