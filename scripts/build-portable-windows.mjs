@@ -38,6 +38,9 @@ const CAMOUFOX_LICENSE_SHA256 = '1f256ecad192880510e84ad60474eab7589218784b9a50b
 
 const APACHE_LICENSE_URL = 'https://www.apache.org/licenses/LICENSE-2.0.txt';
 const APACHE_LICENSE_SHA256 = 'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30';
+const PLAYWRIGHT_VERSION = '1.58.1';
+const PLAYWRIGHT_CODICON_LICENSE_URL = `https://raw.githubusercontent.com/microsoft/playwright/v${PLAYWRIGHT_VERSION}/packages/web/src/third_party/vscode/LICENSE.txt`;
+const PLAYWRIGHT_CODICON_LICENSE_SHA256 = '20535828272932407c2f5172aeb714ac7b374a34e5ecb1825af509f2902cde54';
 
 const OUTPUT_DIR = join(ROOT, 'build', 'portable-windows');
 const CACHE_DIR = join(OUTPUT_DIR, '.cache');
@@ -75,6 +78,21 @@ function runNpm(args, options = {}) {
   }
 
   return run('npm', args, options);
+}
+
+function sourceRevision() {
+  const ciRevision = process.env.GITHUB_SHA?.trim();
+  const localRevision = run('git', ['rev-parse', 'HEAD'], { capture: true }).trim();
+  if (!/^[0-9a-f]{40}$/i.test(localRevision)) {
+    throw new Error(`Unable to determine source revision for portable bundle: ${localRevision}`);
+  }
+  if (ciRevision && !/^[0-9a-f]{40}$/i.test(ciRevision)) {
+    throw new Error(`Invalid GITHUB_SHA for portable bundle: ${ciRevision}`);
+  }
+  if (ciRevision && ciRevision.toLowerCase() !== localRevision.toLowerCase()) {
+    throw new Error(`Portable checkout ${localRevision} does not match CI source ${ciRevision}`);
+  }
+  return localRevision.toLowerCase();
 }
 
 function assertWindowsX64Pe(filePath, label) {
@@ -239,7 +257,11 @@ function createZip(bundleName, zipPath) {
 
 async function main() {
   const notices = readFileSync(join(ROOT, 'THIRD-PARTY-NOTICES.md'), 'utf8');
-  if (!notices.includes(NODE_VERSION.slice(1)) || !notices.includes(`${CAMOUFOX_VERSION}-${CAMOUFOX_RELEASE}`)) {
+  if (
+    !notices.includes(NODE_VERSION.slice(1))
+    || !notices.includes(`${CAMOUFOX_VERSION}-${CAMOUFOX_RELEASE}`)
+    || !notices.includes(`playwright-core ${PLAYWRIGHT_VERSION}`)
+  ) {
     throw new Error('THIRD-PARTY-NOTICES.md is out of sync with pinned portable runtime versions');
   }
 
@@ -339,6 +361,14 @@ async function main() {
   await downloadPinned(CAMOUFOX_LICENSE_URL, camoufoxLicenseCache, CAMOUFOX_LICENSE_SHA256);
   cpSync(camoufoxLicenseCache, join(licensesDir, 'Camoufox-MPL-2.0.txt'));
 
+  const playwrightCodiconLicenseCache = join(CACHE_DIR, 'Playwright-VSCode-Codicon-MIT.txt');
+  await downloadPinned(
+    PLAYWRIGHT_CODICON_LICENSE_URL,
+    playwrightCodiconLicenseCache,
+    PLAYWRIGHT_CODICON_LICENSE_SHA256,
+  );
+  cpSync(playwrightCodiconLicenseCache, join(licensesDir, 'Playwright-VSCode-Codicon-MIT.txt'));
+
   const portableHome = join(BUNDLE_DIR, 'data', 'home');
   const browserDir = join(portableHome, 'AppData', 'Local', 'camoufox', 'camoufox', 'Cache');
   extractZip(camoufoxArchivePath, browserDir);
@@ -379,6 +409,7 @@ async function main() {
     ].join('\r\n'),
     'utf8',
   );
+  writeFileSync(join(BUNDLE_DIR, 'SOURCE-REVISION.txt'), `${sourceRevision()}\n`, 'utf8');
 
   await writeManifest(BUNDLE_DIR);
 

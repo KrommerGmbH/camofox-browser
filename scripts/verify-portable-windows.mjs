@@ -6,7 +6,7 @@ import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'n
 import http from 'node:http';
 import { createRequire } from 'node:module';
 import net from 'node:net';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 
 const bundleRoot = resolve(process.argv[2] ?? '');
 if (!process.argv[2]) {
@@ -38,6 +38,9 @@ const betterSqliteNativeBinary = join(
 const mplLicense = join(bundleRoot, 'licenses', 'MPL-2.0.txt');
 const apacheLicense = join(bundleRoot, 'licenses', 'Apache-2.0.txt');
 const camoufoxLicense = join(bundleRoot, 'licenses', 'Camoufox-MPL-2.0.txt');
+const playwrightCodiconLicense = join(bundleRoot, 'licenses', 'Playwright-VSCode-Codicon-MIT.txt');
+const sourceRevisionPath = join(bundleRoot, 'SOURCE-REVISION.txt');
+const manifestPath = join(bundleRoot, 'manifest.sha256');
 const portableHome = join(bundleRoot, 'data', 'home');
 const bundledCamoufoxDir = join(portableHome, 'AppData', 'Local', 'camoufox', 'camoufox', 'Cache');
 const bundledFontsDir = join(bundledCamoufoxDir, 'fonts');
@@ -51,7 +54,7 @@ if (!existsSync(impitNativeBinary)) {
 if (!existsSync(betterSqliteNativeBinary)) {
   throw new Error('Portable bundle is missing better-sqlite3 Windows x64 native runtime support');
 }
-if (!existsSync(mplLicense) || !existsSync(apacheLicense) || !existsSync(camoufoxLicense)) {
+if (!existsSync(mplLicense) || !existsSync(apacheLicense) || !existsSync(camoufoxLicense) || !existsSync(playwrightCodiconLicense)) {
   throw new Error('Portable bundle is missing required third-party license texts');
 }
 if (existsSync(bundledFontsDir)) {
@@ -80,6 +83,63 @@ function portableEnvironment(extra = {}) {
 
 function sha256Buffer(buffer) {
   return createHash('sha256').update(buffer).digest('hex');
+}
+
+function listRelativeFiles(root) {
+  const files = [];
+  const visit = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const fullPath = join(directory, entry.name);
+      if (entry.isDirectory()) visit(fullPath);
+      else if (entry.isFile()) files.push(relative(root, fullPath).split('\\').join('/'));
+    }
+  };
+  visit(root);
+  return files;
+}
+
+function verifySourceRevisionAndManifest() {
+  if (!existsSync(sourceRevisionPath) || !existsSync(manifestPath)) {
+    throw new Error('Portable bundle is missing source revision or SHA-256 manifest metadata');
+  }
+
+  const sourceRevision = readFileSync(sourceRevisionPath, 'utf8').trim().toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(sourceRevision)) {
+    throw new Error(`Portable source revision is invalid: ${sourceRevision}`);
+  }
+  const expectedRevision = process.env.GITHUB_SHA?.trim().toLowerCase();
+  if (expectedRevision && sourceRevision !== expectedRevision) {
+    throw new Error(`Portable source revision ${sourceRevision} does not match CI source ${expectedRevision}`);
+  }
+
+  const manifestEntries = new Map();
+  for (const line of readFileSync(manifestPath, 'utf8').split(/\r?\n/).filter(Boolean)) {
+    const match = /^([0-9a-f]{64})  (.+)$/.exec(line);
+    if (!match) throw new Error(`Invalid portable manifest line: ${line}`);
+    const [, expectedHash, portablePath] = match;
+    if (manifestEntries.has(portablePath)) throw new Error(`Duplicate portable manifest path: ${portablePath}`);
+    const fullPath = resolve(bundleRoot, portablePath.split('/').join(sep));
+    const relativePath = relative(bundleRoot, fullPath);
+    if (!relativePath || relativePath.startsWith(`..${sep}`) || relativePath === '..' || resolve(fullPath) !== fullPath) {
+      throw new Error(`Portable manifest path escapes bundle root: ${portablePath}`);
+    }
+    if (!existsSync(fullPath) || !statSync(fullPath).isFile()) {
+      throw new Error(`Portable manifest references a missing file: ${portablePath}`);
+    }
+    const actualHash = sha256Buffer(readFileSync(fullPath));
+    if (actualHash !== expectedHash) {
+      throw new Error(`Portable manifest hash mismatch for ${portablePath}: expected ${expectedHash}, got ${actualHash}`);
+    }
+    manifestEntries.set(portablePath, expectedHash);
+  }
+
+  const actualFiles = listRelativeFiles(bundleRoot).filter((portablePath) => portablePath !== 'manifest.sha256');
+  const missingFromManifest = actualFiles.filter((portablePath) => !manifestEntries.has(portablePath));
+  if (missingFromManifest.length > 0 || manifestEntries.size !== actualFiles.length) {
+    throw new Error(`Portable manifest does not exactly cover extracted files: ${missingFromManifest.slice(0, 5).join(', ')}`);
+  }
+
+  return sourceRevision;
 }
 
 function windowsDefaultProfileDirectoryName(userId) {
@@ -167,6 +227,7 @@ async function waitUntilStopped(url) {
 
 const localPagePort = await getFreePort();
 const serverPort = await getFreePort();
+const verifiedSourceRevision = verifySourceRevisionAndManifest();
 const localPageServer = http.createServer((_req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end('<!doctype html><html><head><title>Welcome</title></head><body><main><h1>Welcome</h1><p>Ready.</p></main></body></html>');
@@ -276,6 +337,7 @@ try {
   console.log(`PASS bundled Node: ${process.execPath}`);
   console.log('PASS Windows x64 native dependencies load with bundled Node');
   console.log('PASS third-party license bundle');
+  console.log(`PASS source revision and manifest: ${verifiedSourceRevision}`);
   console.log(`PASS CLI version: ${packageJson.version}`);
   console.log(`PASS health: ${baseUrl}/health`);
   console.log('PASS local browser flow: create -> navigate -> snapshot -> close');
