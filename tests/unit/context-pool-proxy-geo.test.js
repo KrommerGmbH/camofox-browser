@@ -199,7 +199,7 @@ describe('ContextPool proxy-geo identity', () => {
     await pool.closeContext(profileKey);
   });
 
-  test('encoded default profile keys keep the legacy raw-user persistent profile directory', async () => {
+  test('encoded default profile keys use the platform-specific persistent profile directory', async () => {
     const pool = new ContextPool();
     const userId = 'legacy::owner';
     const profileKey = defaultProfileKey(userId);
