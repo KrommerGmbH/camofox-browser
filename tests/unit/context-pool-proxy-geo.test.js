@@ -13,6 +13,7 @@ jest.mock('../../dist/src/utils/config', () => ({
     maxSessions: 2, // Force small pool for eviction tests
     userDataDir: '/tmp/camofox-test',
     profilesDir: MOCK_PROFILES_DIR,
+    headless: true,
     port: 3000,
     fingerprintDefaults: {},
     proxy: {
