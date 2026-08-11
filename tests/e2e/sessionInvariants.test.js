@@ -5,6 +5,7 @@ const { promisify } = require('util');
 
 const { startServer, stopServer, getServerUrl } = require('../helpers/startServer');
 const { startTestSite, stopTestSite, getTestSiteUrl } = require('../helpers/testSite');
+const { resetTestStateDirectories } = require('../helpers/test-state-reset');
 
 const execFileAsync = promisify(execFile);
 
@@ -97,6 +98,13 @@ describe('Session invariants', () => {
     for (const userId of cleanupUsers) {
       await deleteSession(serverUrl, userId).catch(() => {});
     }
+    await waitForPoolSize(serverUrl, 0, 15000);
+    resetTestStateDirectories([
+      'CAMOFOX_PROFILES_DIR',
+      'CAMOFOX_COOKIES_DIR',
+      'CAMOFOX_DOWNLOADS_DIR',
+      'CAMOFOX_TRACES_DIR',
+    ]);
     cleanupUsers.clear();
   });
 

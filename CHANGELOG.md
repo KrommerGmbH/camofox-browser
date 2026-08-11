@@ -20,6 +20,7 @@
 ### Tests
 - Added focused Windows platform and VNC side-effect regression tests plus a launcher test that removes Node from `PATH` and verifies the current runtime is reused.
 - Jest now isolates profiles, cookies, downloads, and traces under a disposable temp root and removes it after the run, preventing test/build verification from accumulating persistent state under the operator's `~/.camofox` directory.
+- Long-running session lifecycle coverage now reclaims its disposable profiles/downloads/cookies/traces after each fully closed case, preventing in-run profile buildup from exhausting Windows CI while retaining every lifecycle assertion.
 
 ## [2.4.6] - 2026-06-17
 
