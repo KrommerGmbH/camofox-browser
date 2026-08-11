@@ -14,6 +14,7 @@ import { firefox, type BrowserContext, type BrowserContextOptions } from 'playwr
 
 import { loadConfig } from '../utils/config';
 import { assertBrowserPlatformSupported, getHostArchitecture, getHostOS } from '../utils/platform-support';
+import { profileDirForProfileKey } from '../utils/profile-path';
 import { readVersionedSidecar, writeVersionedSidecar } from '../utils/sidecar-version';
 import { log } from '../middleware/logging';
 import type { ResolvedProxyConfig } from '../types';
@@ -63,38 +64,6 @@ function getInstalledCamoufoxVersion(): string {
 	} catch {
 		return 'unknown';
 	}
-}
-
-function decodeDefaultProfileUserId(profileKey: string): string | null {
-	if (!profileKey.startsWith('u:') || profileKey.indexOf(':', 2) !== -1) return null;
-	try {
-		const encoded = profileKey.slice(2);
-		const bytes = Buffer.from(encoded, 'base64url');
-		if (bytes.length % 2 !== 0) return null;
-		const decoded = bytes.toString('utf16le');
-		if (/^(?:u|s|p|o):/.test(decoded)) return null;
-		for (let i = 0; i < decoded.length; i += 1) {
-			const code = decoded.charCodeAt(i);
-			if (code >= 0xd800 && code <= 0xdbff) {
-				if (i + 1 >= decoded.length) return null;
-				const next = decoded.charCodeAt(i + 1);
-				if (next < 0xdc00 || next > 0xdfff) return null;
-				i += 1;
-			} else if (code >= 0xdc00 && code <= 0xdfff) {
-				return null;
-			}
-		}
-		return `u:${Buffer.from(decoded, 'utf16le').toString('base64url')}` === profileKey ? decoded : null;
-	} catch {
-		return null;
-	}
-}
-
-function profileDirForProfileKey(profileKey: string): string {
-	// Avoid path traversal from untrusted route params.
-	const defaultUserId = decodeDefaultProfileUserId(String(profileKey));
-	const safe = encodeURIComponent(defaultUserId ?? String(profileKey));
-	return path.join(CONFIG.profilesDir, safe);
 }
 
 function pickSeedOptions(opts?: BrowserContextOptions): PoolEntry['seedOptions'] | undefined {
@@ -371,7 +340,7 @@ export class ContextPool {
 		const headless = this.headlessOverrides.get(userId) ?? CONFIG.headless;
 		assertBrowserPlatformSupported(hostOS, getHostArchitecture(), headless);
 
-		const profileDir = profileDirForProfileKey(profileKey);
+		const profileDir = profileDirForProfileKey(CONFIG.profilesDir, profileKey);
 		fs.mkdirSync(profileDir, { recursive: true });
 		const compatPath = path.join(profileDir, 'compatibility.json');
 
@@ -635,7 +604,7 @@ export class ContextPool {
 			return entry;
 		}
 
-		const profileDir = profileDirForProfileKey(profileKey);
+		const profileDir = profileDirForProfileKey(CONFIG.profilesDir, profileKey);
 		const newEntry: PoolEntry = {
 			context: null as unknown as BrowserContext,
 			userId: normalized,
