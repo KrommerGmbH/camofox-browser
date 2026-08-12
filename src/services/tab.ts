@@ -651,12 +651,12 @@ function getTrackedInFlightGuardCheckCount(page: Page, token: number): number {
 	return trackedInFlightGuardChecks.get(page)?.get(token) || 0;
 }
 
-async function yieldToPostActionNavigation(page: Page): Promise<void> {
+async function waitForPostActionNavigationSettle(page: Page): Promise<void> {
 	if (typeof page.waitForTimeout === 'function') {
-		await page.waitForTimeout(0);
+		await page.waitForTimeout(POST_ACTION_NAVIGATION_SETTLE_MS);
 		return;
 	}
-	await new Promise((resolve) => setTimeout(resolve, 0));
+	await new Promise((resolve) => setTimeout(resolve, POST_ACTION_NAVIGATION_SETTLE_MS));
 }
 
 function createPostActionNavigationTimeoutError(): Error & { statusCode: number } {
@@ -674,8 +674,12 @@ async function withPostActionNavigationDeadline<T>(promise: Promise<T>, deadline
 }
 
 async function drainPostActionNavigation(page: Page, actionToken: number): Promise<void> {
+	// Keep the action token active for the full settle window. DOM event
+	// handlers can enqueue navigation after the Playwright action promise has
+	// resolved, especially on slower Windows runners. A single event-loop yield
+	// can finish tracking before that navigation is attributed to this action.
+	await waitForPostActionNavigationSettle(page);
 	const deadline = Date.now() + POST_ACTION_NAVIGATION_DRAIN_TIMEOUT_MS;
-	await withPostActionNavigationDeadline(yieldToPostActionNavigation(page), deadline);
 
 	while (true) {
 		throwTrackedBlockedNavigationErrorIfPresent(page, actionToken);

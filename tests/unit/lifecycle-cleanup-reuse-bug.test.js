@@ -60,6 +60,7 @@ jest.mock('../../dist/src/middleware/logging', () => ({
 const {
   runLifecycleIdleCleanup,
   getSession,
+  getSessionMapKey,
   clearAllState,
   __getSessionsMapForTests,
 } = require('../../dist/src/services/session');
@@ -317,6 +318,91 @@ describe('runLifecycleIdleCleanup - reuse race bug', () => {
 
     await Promise.resolve();
     await Promise.resolve();
+    expect(getSessionResolved).toBe(false);
+
+    allowCloseResolve();
+    await cleanupPromise;
+
+    const reusedSession = await getSessionPromise;
+    expect(reusedSession.context).not.toBe(closingContext);
+    await expect(reusedSession.context.newPage()).resolves.toBeDefined();
+  }, 30000);
+
+  it('should not hand back a context when the request starts immediately before idle cleanup closes it', async () => {
+    const userId = 'pre-close-race-user';
+    const profileKey = getSessionMapKey(userId, null);
+    const sessions = __getSessionsMapForTests();
+
+    let closeStartedResolve;
+    const closeStarted = new Promise((resolve) => {
+      closeStartedResolve = resolve;
+    });
+    let allowCloseResolve;
+    const allowClose = new Promise((resolve) => {
+      allowCloseResolve = resolve;
+    });
+    let closed = false;
+
+    const closingContext = {
+      pages: () => [],
+      newPage: async () => {
+        if (closed) {
+          throw new Error('browserContext.newPage: Target page, context or browser has been closed');
+        }
+        return { close: async () => {} };
+      },
+      close: async () => {
+        closeStartedResolve();
+        await allowClose;
+        closed = true;
+      },
+      on: () => {},
+    };
+
+    const staleLastAccess = Date.now() - 10000;
+    sessions.set(profileKey, {
+      context: closingContext,
+      tabGroups: new Map(),
+      lastAccess: staleLastAccess,
+    });
+    contextPool.pool.set(profileKey, {
+      userId,
+      profileKey,
+      profileDir: '/tmp/camofox-test/pre-close-race-profile',
+      context: closingContext,
+      createdAt: Date.now() - 20000,
+      lastAccess: staleLastAccess,
+      staged: false,
+      launching: undefined,
+    });
+
+    const cleanupStartedMs = Date.now();
+    const sessionSnapshot = new Map();
+    const contextSnapshot = new Map();
+    for (const [key, session] of sessions) {
+      sessionSnapshot.set(key, {
+        context: session.context,
+        tabGroups: new Map(session.tabGroups),
+        lastAccess: session.lastAccess,
+      });
+    }
+    for (const [key, entry] of contextPool.pool) {
+      contextSnapshot.set(key, { ...entry });
+    }
+
+    let getSessionResolved = false;
+    const getSessionPromise = getSession(userId).then((session) => {
+      getSessionResolved = true;
+      return session;
+    });
+
+    // getSession() has passed the idle-closure check but yielded before it can
+    // reuse the pool entry. Start cleanup in that exact gap.
+    const cleanupPromise = runLifecycleIdleCleanup(sessionSnapshot, contextSnapshot, cleanupStartedMs);
+    await closeStarted;
+    await Promise.resolve();
+    await Promise.resolve();
+
     expect(getSessionResolved).toBe(false);
 
     allowCloseResolve();

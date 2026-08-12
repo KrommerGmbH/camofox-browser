@@ -33,6 +33,7 @@ export interface PoolEntry {
 	lastAccess: number;
 	createdAt: number;  // Timestamp when this entry was created
 	launching?: Promise<BrowserContext>;
+	closing?: Promise<void>;
 	staged?: boolean;
 	stagedGeneration?: string;
 	virtualDisplay?: any;
@@ -547,7 +548,7 @@ export class ContextPool {
 
 		let lru: PoolEntry | null = null;
 		for (const entry of this.pool.values()) {
-			if (entry.launching || entry.staged) continue;
+			if (entry.launching || entry.closing || entry.staged) continue;
 			if (!lru || entry.lastAccess < lru.lastAccess) lru = entry;
 		}
 		if (!lru) return;
@@ -568,6 +569,15 @@ export class ContextPool {
 		const normalized = String(userId);
 		let entry = this.pool.get(profileKey);
 		const seed = pickSeedOptions(options);
+
+		if (entry?.closing) {
+			// Never hand out a context once shutdown has started. A request can
+			// pass the lifecycle idle-closure check immediately before cleanup
+			// begins closing the pool entry; wait for that exact close to finish,
+			// then re-read the pool and relaunch if needed.
+			await entry.closing;
+			entry = this.pool.get(profileKey);
+		}
 
 		if (entry) {
 			if (staged) {
@@ -649,24 +659,31 @@ export class ContextPool {
 		const normalized = String(profileKey);
 		const entry = this.pool.get(normalized);
 		if (!entry || entry.staged) return;
-
-		try {
-			if (entry.launching) {
-				await entry.launching.catch(() => {});
-				entry.launching = undefined;
-			}
-			await entry.context?.close().catch(() => {});
-		} finally {
-			this.cleanupVirtualDisplay(entry);
-			// Only delete if this entry is still in the pool (avoid deleting a newer entry with same key)
-			const currentEntry = this.pool.get(normalized);
-			if (currentEntry === entry) {
-				this.pool.delete(normalized);
-				log('info', 'persistent context removed from pool', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
-			} else {
-				log('info', 'persistent context closed but newer entry exists', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
-			}
+		if (entry.closing) {
+			await entry.closing;
+			return;
 		}
+
+		entry.closing = (async () => {
+			try {
+				if (entry.launching) {
+					await entry.launching.catch(() => {});
+					entry.launching = undefined;
+				}
+				await entry.context?.close().catch(() => {});
+			} finally {
+				this.cleanupVirtualDisplay(entry);
+				// Only delete if this entry is still in the pool (avoid deleting a newer entry with same key)
+				const currentEntry = this.pool.get(normalized);
+				if (currentEntry === entry) {
+					this.pool.delete(normalized);
+					log('info', 'persistent context removed from pool', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
+				} else {
+					log('info', 'persistent context closed but newer entry exists', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
+				}
+			}
+		})();
+		await entry.closing;
 	}
 
 	async closeContextIfMatches(profileKey: string, expectedCreatedAt: number, expectedLastAccess?: number): Promise<void> {
