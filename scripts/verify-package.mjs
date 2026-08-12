@@ -66,10 +66,11 @@ function runNpm(args, options = {}) {
 
 function runInstalledBin(binPath, cwd) {
   if (process.platform === 'win32') {
-    const command = `"${binPath}.cmd" --help`;
+    const command = `call "${binPath}.cmd" --help`;
     return spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', command], {
       cwd,
       encoding: 'utf8',
+      windowsVerbatimArguments: true,
     });
   }
   return spawnSync(binPath, ['--help'], { cwd, encoding: 'utf8' });
