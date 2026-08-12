@@ -57,4 +57,23 @@ describe('Windows portable build process invocation', () => {
     expect(builder).toContain('Playwright-VSCode-Codicon-MIT.txt');
     expect(builder).toContain('20535828272932407c2f5172aeb714ac7b374a34e5ecb1825af509f2902cde54');
   });
+
+  test('pins and verifies the exact better-sqlite3 Windows x64 prebuild before installation', () => {
+    const builder = fs.readFileSync(
+      path.join(__dirname, '../../scripts/build-portable-windows.mjs'),
+      'utf8',
+    );
+
+    expect(builder).toContain('better-sqlite3-v12.6.2-node-v127-win32-x64.tar.gz');
+    expect(builder).toContain('2609fd25d59c4c16b43758c1fb2b4afa653925e04941cadae5be28f2d6cd2dc8');
+    expect(builder).toContain('f83faac0db0c2737b259073402d83e05eafdde7ff046582ecee280a66056586e');
+    expect(builder).toContain(
+      'await downloadPinned(BETTER_SQLITE_URL, betterSqliteArchivePath, BETTER_SQLITE_SHA256);',
+    );
+    expect(builder).toContain('extractTarGz(betterSqliteArchivePath, betterSqliteDir);');
+    expect(builder).toContain(
+      'await verifySha256(betterSqliteBinary, BETTER_SQLITE_BINARY_SHA256);',
+    );
+    expect(builder).not.toContain('const prebuildInstall =');
+  });
 });
