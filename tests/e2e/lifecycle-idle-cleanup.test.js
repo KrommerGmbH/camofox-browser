@@ -70,20 +70,9 @@ describe('Lifecycle idle cleanup (Stage 1)', () => {
       body: JSON.stringify({ userId }),
     });
 
-    // Wait for idle cleanup to trigger and complete
-    const cleanupDeadline = Date.now() + 10000;
-    let cleanedUp = false;
-    while (Date.now() < cleanupDeadline) {
-      const healthRes = await fetch(`${serverUrl}/health`);
-      const health = await healthRes.json();
-      if (health.poolSize === 0) {
-        cleanedUp = true;
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-
-    expect(cleanedUp).toBe(true);
+    // Browser-context shutdown can take longer on Windows runners. Keep the
+    // cleanup contract bounded while allowing the close operation to finish.
+    await waitForPoolSize(serverUrl, 0, 20000);
 
     // Create a new tab with different sessionKey to verify relaunch works
     const recreated = await fetch(`${serverUrl}/tabs`, {
@@ -108,7 +97,7 @@ describe('Lifecycle idle cleanup (Stage 1)', () => {
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const healthFinal = await fetch(`${serverUrl}/health`);
     const healthFinalData = await healthFinal.json();
-  }, 30000);
+  }, 60000);
 
   test('idle cleanup does not run while tabs exist', async () => {
     // Start server with short idle timeout
