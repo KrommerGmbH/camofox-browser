@@ -633,8 +633,8 @@ export class ContextPool {
 
 			// Capture the current pool entry's generation timestamp before
 			// any await. This prevents the replacement race: if a new entry
-			// with the same key appears during the dynamic import / teardown
-			// await, the generation check below will NOT close the newer
+			// with the same key appears during teardown, the generation check
+			// below will NOT close the newer
 			// healthy context.
 			const entry = this.pool.get(normalizedProfile);
 
@@ -666,11 +666,10 @@ export class ContextPool {
 			// await and must not be destroyed" (HIGH B).
 			const generation = entry ? entry.createdAt : undefined;
 
-			// Lazy import to avoid circular dependency with session.ts.
-			// Single import — both getSessionSnapshot and teardownSessionByKey
-			// are resolved in one await, then getSessionSnapshot is called
-			// synchronously before teardownSessionByKey's internal await.
-			const { getSessionSnapshot, teardownSessionByKey } = await import('./session');
+			// Resolve session.ts lazily to avoid the top-level circular dependency,
+			// but do it synchronously so the durable session snapshot is captured
+			// before this method's first await.
+			const { getSessionSnapshot, teardownSessionByKey } = require('./session') as typeof import('./session');
 
 			// Capture the durable session identity (owner + generation)
 			// synchronously, before teardownSessionByKey's internal await
