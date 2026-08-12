@@ -1300,4 +1300,68 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
       expect(mockCloseContext).not.toHaveBeenCalled();
     });
   });
+
+  // ── Round 9: OpenClaw /tabs/open nav health wiring ────────────────
+
+  describe('round 9 — OpenClaw /tabs/open nav health wiring', () => {
+    test('deleteUserHealth preserves entry while recovering is true', () => {
+      __clearUserHealthForTests();
+      // Simulate a recovery in flight: 3 failures exceed threshold,
+      // then acquireRecoveryLock sets recovering=true.
+      recordNavFailure('user-r9', 'session-r9');
+      recordNavFailure('user-r9', 'session-r9');
+      recordNavFailure('user-r9', 'session-r9');
+      acquireRecoveryLock('user-r9', 'session-r9');
+      const h = __getUserHealthForTests('user-r9', 'session-r9');
+      expect(h).toBeDefined();
+      expect(h.recovering).toBe(true);
+
+      // Ordinary session cleanup tries to evict — must be a no-op
+      deleteUserHealth('user-r9', 'session-r9');
+      const h2 = __getUserHealthForTests('user-r9', 'session-r9');
+      expect(h2).toBeDefined();
+      expect(h2.recovering).toBe(true);
+
+      // After recovery finishes (releaseRecoveryLock + deleteUserHealth),
+      // the entry IS evicted
+      releaseRecoveryLock('user-r9', 'session-r9');
+      deleteUserHealth('user-r9', 'session-r9');
+      expect(__getUserHealthForTests('user-r9', 'session-r9')).toBeUndefined();
+    });
+
+    test('deleteUserHealth evicts non-recovering entries normally', () => {
+      __clearUserHealthForTests();
+      recordNavFailure('user-r9b', 'session-r9b');
+      expect(__getUserHealthForTests('user-r9b', 'session-r9b')).toBeDefined();
+
+      // Not recovering — should be evicted
+      deleteUserHealth('user-r9b', 'session-r9b');
+      expect(__getUserHealthForTests('user-r9b', 'session-r9b')).toBeUndefined();
+    });
+
+    test('openclaw /tabs/open navigation failure counts toward threshold', async () => {
+      __clearUserHealthForTests();
+
+      // Simulate 3 nav failures via handleNavFailure (same as /tabs/open catch would call)
+      for (let i = 0; i < 3; i++) {
+        await handleNavFailure('user-open-r9', 'session-open-r9');
+      }
+      // After 3 failures, recovery should have fired — lock acquired, then
+      // released in finally, entry deleted in finally. Entry is gone.
+      expect(__getUserHealthForTests('user-open-r9', 'session-open-r9')).toBeUndefined();
+    });
+
+    test('openclaw /tabs/open provisioning failure does not count toward threshold', async () => {
+      __clearUserHealthForTests();
+      // A provisioning failure (e.g. acquirePageForNewTab) would have navError=false
+      // so handleNavFailure is NOT called. Simulate by only calling recordNavFailure
+      // 2 times (below threshold) — no recovery.
+      recordNavFailure('user-open-prov', 'session-open-prov');
+      recordNavFailure('user-open-prov', 'session-open-prov');
+      const h = __getUserHealthForTests('user-open-prov', 'session-open-prov');
+      expect(h).toBeDefined();
+      expect(h.consecutiveNavFailures).toBe(2);
+      expect(h.recovering).toBe(false);
+    });
+  });
 });

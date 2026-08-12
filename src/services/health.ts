@@ -172,9 +172,18 @@ export function resetHealth(): void {
  * Evicts a session's health entry from the map. Called after recovery
  * completes to prevent the map from growing unbounded over the
  * process lifetime. Safe to call even if the session has no entry.
+ *
+ * Preserves entries where `recovering === true`: ordinary session
+ * cleanup (timeout, explicit close, bulk close) must not evict a
+ * health entry while an in-flight recovery holds the lock, otherwise
+ * a concurrent request can recreate the entry and acquire a second
+ * recovery lock. The lock owner's `finally` block in
+ * `handleNavFailure` is the sole eviction path while recovering.
  */
 export function deleteUserHealth(userId: string, sessionKey?: string): void {
 	const key = healthKey(userId, sessionKey);
+	const h = sessionHealthMap.get(key);
+	if (h?.recovering) return;
 	sessionHealthMap.delete(key);
 }
 
