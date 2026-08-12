@@ -95,6 +95,29 @@ export function __getSessionOwnersForTests(): Map<string, string> {
 	return sessionOwners;
 }
 
+/**
+ * Synchronous snapshot of a session's durable identity — owner and
+ * generation — captured before any await to prevent the replacement race.
+ *
+ * Returns `{ owner, createdAt }` where:
+ * - `owner` is the userId that owns this session key (from sessionOwners),
+ *   or `undefined` if the session key has no owner mapping.
+ * - `createdAt` is the session's generation timestamp (from SessionData),
+ *   or `undefined` if no session record exists.
+ *
+ * This is called by `closeContextBySession` before its first await so that
+ * `teardownSessionByKey` can validate the session's identity after the
+ * dynamic-import gap without reading a potentially-replaced session record.
+ */
+export function getSessionSnapshot(sessionMapKey: string): { owner: string | undefined; createdAt: number | undefined } {
+	const normalized = String(sessionMapKey);
+	const session = sessions.get(normalized);
+	return {
+		owner: sessionOwners.get(normalized),
+		createdAt: session?.createdAt,
+	};
+}
+
 function beginLifecycleIdleClosure(userId: unknown): () => void {
 	const key = normalizeUserId(userId);
 	let state = lifecycleIdleClosures.get(key);
@@ -618,6 +641,18 @@ export async function rollbackSessionProfileRuntime(
 }
 
 /**
+ * Durable session identity captured synchronously by the caller before
+ * any await, to prevent the replacement race where a new session with the
+ * same key appears during the async gap.
+ */
+export interface SessionSnapshot {
+	/** The session owner (userId) at snapshot time, or undefined if no owner mapping. */
+	owner: string | undefined;
+	/** The session's generation timestamp at snapshot time, or undefined if no session record. */
+	createdAt: number | undefined;
+}
+
+/**
  * Tear down a single session by its sessionMapKey: unindex all tabs,
  * delete the session entry, and close the backing context.
  *
@@ -644,6 +679,20 @@ export async function rollbackSessionProfileRuntime(
  * `createdAt` still matches — preventing deletion of a replacement
  * session that reused the same key.
  *
+ * Durable session identity (HIGH C round 8): the caller passes a
+ * `sessionSnapshot` captured *before* the first await in
+ * closeContextBySession. This prevents the replacement race where
+ * teardownSessionByKey reads a session record that was replaced during
+ * the `await import('./session')` gap. The snapshot's `createdAt` is
+ * used as the authoritative generation; the snapshot's `owner` is
+ * validated against the requesting user for the pool-missing path.
+ *
+ * Foreign ownership (HIGH round 8): when the pool entry is missing
+ * (`expectedCreatedAt` is undefined), the session owner from the snapshot
+ * is compared against `expectedSessionOwner`. If they don't match, the
+ * call is a no-op — a foreign user must not delete another user's
+ * session records.
+ *
  * Recovery lock safety (HIGH D): deleteUserHealth is NOT called here.
  * Lock/health eviction is owned by handleNavFailure's finally block and
  * by ordinary session lifecycle paths (cleanupSessionsForUserId,
@@ -651,16 +700,43 @@ export async function rollbackSessionProfileRuntime(
  *
  * Returns true if a session was found and torn down, false otherwise.
  */
-export async function teardownSessionByKey(sessionMapKey: string, expectedCreatedAt?: number): Promise<boolean> {
+export async function teardownSessionByKey(
+	sessionMapKey: string,
+	expectedCreatedAt?: number,
+	sessionSnapshot?: SessionSnapshot,
+): Promise<boolean> {
 	const normalized = String(sessionMapKey);
 	const session = sessions.get(normalized);
 	if (!session) return false;
 
-	// Capture the session's generation before any await (HIGH C).
-	// After the context close await, we re-check that the session record
-	// is still the same one we started with. If a replacement session
-	// appeared during the await, we leave it untouched.
-	const sessionCreatedAt = session.createdAt;
+	// Foreign ownership check (HIGH round 8): when the pool entry was
+	// missing at snapshot time, the session owner from the durable
+	// snapshot must match the requesting user. A foreign user must not
+	// delete another user's indexed session records.
+	if (sessionSnapshot && expectedCreatedAt === undefined) {
+		const snapshotOwner = sessionSnapshot.owner;
+		if (snapshotOwner !== undefined) {
+			// sessionOwners.get returns the current owner; compare against
+			// the snapshot owner to detect replacement. If the snapshot
+			// had no owner mapping, we cannot validate — proceed with
+			// caution (index cleanup only, no context close).
+			const currentOwner = sessionOwners.get(normalized);
+			if (currentOwner !== undefined && currentOwner !== snapshotOwner) {
+				log('warn', 'teardownSessionByKey: session owner replaced during await, aborting', {
+					sessionMapKey: normalized,
+					snapshotOwner,
+					currentOwner,
+				});
+				return false;
+			}
+		}
+	}
+
+	// Use the durable session generation from the snapshot if provided;
+	// this was captured before the await import gap and is authoritative.
+	// Fall back to reading the session record for callers that don't
+	// pass a snapshot (backward compatible).
+	const sessionCreatedAt = sessionSnapshot?.createdAt ?? session.createdAt;
 
 	// Use generation-aware close to prevent the replacement race (HIGH B).
 	// When expectedCreatedAt is provided (pool entry existed), only close

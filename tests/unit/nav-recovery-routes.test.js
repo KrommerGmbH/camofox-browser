@@ -35,6 +35,9 @@ const mockPool = new Map();
 // The contextPool mock delegates to teardownSessionByKey for matched keys,
 // using the same generation-aware logic as the production code.
 // HIGH A: foreign owner is a no-op. HIGH B: missing pool entry = no close.
+// HIGH round 8: captures session snapshot before teardown, and checks
+// the snapshot owner against the requesting user when the pool entry
+// is missing (foreign-ownership fail-closed).
 const mockCloseContextBySession = jest.fn(async (userId, profileKey) => {
   if (profileKey !== undefined && profileKey !== null && profileKey !== '') {
     const entry = mockPool.get(profileKey);
@@ -52,8 +55,19 @@ const mockCloseContextBySession = jest.fn(async (userId, profileKey) => {
     // Owner matches or entry is missing. Capture generation if entry exists.
     const generation = entry ? entry.createdAt : undefined;
 
+    // Capture durable session identity synchronously (HIGH round 8).
     const sessionModule = require('../../dist/src/services/session');
-    await sessionModule.teardownSessionByKey(profileKey, generation);
+    const sessionSnapshot = sessionModule.getSessionSnapshot(profileKey);
+
+    // Foreign ownership check for the pool-missing path (HIGH round 8):
+    // when the pool entry is gone, the pool-level owner check above could
+    // not fire. The snapshot owner tells us who the session belongs to.
+    // If it doesn't match the requesting user, fail closed.
+    if (generation === undefined && sessionSnapshot.owner !== undefined && sessionSnapshot.owner !== String(userId)) {
+      return;
+    }
+
+    await sessionModule.teardownSessionByKey(profileKey, generation, sessionSnapshot);
     return;
   }
   // No key → user-wide fallback
@@ -1173,6 +1187,117 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
       // After handleNavFailure's finally block: lock released + health evicted
       expect(isUserRecovering(userId, sessionKey)).toBe(false);
       expect(__getUserHealthForTests(userId, sessionKey)).toBeUndefined();
+    });
+  });
+
+  // ── 9. Round 8 — durable session identity + foreign owner ─────────
+
+  describe('round 8 — replacement during pre-teardown async gap', () => {
+    test('session snapshot captured before await prevents tearing down replacement', async () => {
+      const userId = 'test-user-r8-replacement';
+      const sessionKey = 'session-key-r8-replacement';
+      const sessions = sessionModule.__getSessionsMapForTests();
+      const sessionOwners = sessionModule.__getSessionOwnersForTests();
+
+      const originalCreatedAt = 1000;
+      const replacementCreatedAt = 2000;
+
+      sessions.set(sessionKey, {
+        context: { close: jest.fn().mockResolvedValue(undefined) },
+        tabGroups: new Map([[sessionKey, new Map([['tab-r8', {
+          page: { url: () => 'about:blank', close: jest.fn() },
+          visitedUrls: new Set(), refs: new Map(), toolCalls: 0, downloads: [],
+        }]])]]),
+        lastAccess: Date.now(),
+        createdAt: originalCreatedAt,
+      });
+      sessionOwners.set(sessionKey, userId);
+      sessionModule.indexTab('tab-r8', sessionKey);
+
+      mockPool.set(sessionKey, { userId, createdAt: originalCreatedAt, staged: false });
+
+      const snapshot = sessionModule.getSessionSnapshot(sessionKey);
+      expect(snapshot.owner).toBe(userId);
+      expect(snapshot.createdAt).toBe(originalCreatedAt);
+
+      mockCloseContextIfMatches.mockImplementationOnce(async () => {
+        sessions.set(sessionKey, {
+          context: { close: jest.fn().mockResolvedValue(undefined) },
+          tabGroups: new Map([[sessionKey, new Map()]]),
+          lastAccess: Date.now(),
+          createdAt: replacementCreatedAt,
+        });
+      });
+
+      const result = await sessionModule.teardownSessionByKey(sessionKey, originalCreatedAt, snapshot);
+
+      expect(result).toBe(true);
+      const currentSession = sessions.get(sessionKey);
+      expect(currentSession).toBeDefined();
+      expect(currentSession.createdAt).toBe(replacementCreatedAt);
+      expect(sessionModule.findTabById('tab-r8', userId)).toBeNull();
+      expect(sessionOwners.get(sessionKey)).toBe(userId);
+    });
+  });
+
+  describe('round 8 — missing pool entry with foreign durable session owner', () => {
+    test('foreign user cannot delete victim session when pool entry is gone', async () => {
+      const victimUser = 'victim-user-r8';
+      const foreignUser = 'foreign-user-r8';
+      const sessionKey = 'session-key-r8-foreign';
+
+      const sessions = sessionModule.__getSessionsMapForTests();
+      const sessionOwners = sessionModule.__getSessionOwnersForTests();
+
+      sessions.set(sessionKey, {
+        context: { close: jest.fn().mockResolvedValue(undefined) },
+        tabGroups: new Map([[sessionKey, new Map([['tab-victim-r8', {
+          page: { url: () => 'about:blank', close: jest.fn() },
+          visitedUrls: new Set(), refs: new Map(), toolCalls: 0, downloads: [],
+        }]])]]),
+        lastAccess: Date.now(),
+        createdAt: 1000,
+      });
+      sessionOwners.set(sessionKey, victimUser);
+      sessionModule.indexTab('tab-victim-r8', sessionKey);
+
+      // Pool entry is MISSING — do NOT set in mockPool
+
+      await mockCloseContextBySession(foreignUser, sessionKey);
+
+      expect(sessions.has(sessionKey)).toBe(true);
+      expect(sessionOwners.get(sessionKey)).toBe(victimUser);
+      expect(sessionModule.findTabById('tab-victim-r8', victimUser)).not.toBeNull();
+      expect(mockCloseContext).not.toHaveBeenCalled();
+    });
+
+    test('owner can still tear down own session when pool entry is gone', async () => {
+      const userId = 'owner-user-r8';
+      const sessionKey = 'session-key-r8-owner-missing-pool';
+
+      const sessions = sessionModule.__getSessionsMapForTests();
+      const sessionOwners = sessionModule.__getSessionOwnersForTests();
+
+      sessions.set(sessionKey, {
+        context: { close: jest.fn().mockResolvedValue(undefined) },
+        tabGroups: new Map([[sessionKey, new Map([['tab-owner-r8', {
+          page: { url: () => 'about:blank', close: jest.fn() },
+          visitedUrls: new Set(), refs: new Map(), toolCalls: 0, downloads: [],
+        }]])]]),
+        lastAccess: Date.now(),
+        createdAt: 1000,
+      });
+      sessionOwners.set(sessionKey, userId);
+      sessionModule.indexTab('tab-owner-r8', sessionKey);
+
+      // Pool entry is missing — do NOT set in mockPool
+
+      await mockCloseContextBySession(userId, sessionKey);
+
+      expect(sessions.has(sessionKey)).toBe(false);
+      expect(sessionOwners.has(sessionKey)).toBe(false);
+      expect(sessionModule.findTabById('tab-owner-r8', userId)).toBeNull();
+      expect(mockCloseContext).not.toHaveBeenCalled();
     });
   });
 });

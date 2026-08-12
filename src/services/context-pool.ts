@@ -666,15 +666,47 @@ export class ContextPool {
 			// await and must not be destroyed" (HIGH B).
 			const generation = entry ? entry.createdAt : undefined;
 
+			// Lazy import to avoid circular dependency with session.ts.
+			// Single import — both getSessionSnapshot and teardownSessionByKey
+			// are resolved in one await, then getSessionSnapshot is called
+			// synchronously before teardownSessionByKey's internal await.
+			const { getSessionSnapshot, teardownSessionByKey } = await import('./session');
+
+			// Capture the durable session identity (owner + generation)
+			// synchronously, before teardownSessionByKey's internal await
+			// (HIGH round 8). This prevents the replacement race where a new
+			// session with the same key appears during the context-close await
+			// inside teardownSessionByKey. The snapshot's createdAt is the
+			// authoritative session generation; the snapshot's owner is
+			// validated against the requesting user for the pool-missing path.
+			const sessionSnapshot = getSessionSnapshot(normalizedProfile);
+
+			// Foreign ownership check for the pool-missing path (HIGH round 8):
+			// When the pool entry is already gone, the pool-level owner check
+			// above could not fire. The durable session snapshot's owner tells
+			// us who the session belongs to. If the snapshot owner doesn't
+			// match the requesting user, this is a foreign call — fail closed.
+			// A foreign user must not delete another user's indexed session
+			// records when the pool entry is missing.
+			if (generation === undefined && sessionSnapshot.owner !== undefined && sessionSnapshot.owner !== normalizedUser) {
+				log('warn', 'closeContextBySession: pool entry missing and session owner is foreign, no-op', {
+					requestedUser: normalizedUser,
+					sessionOwner: sessionSnapshot.owner,
+					profileKey: normalizedProfile,
+				});
+				return;
+			}
+
 			// Full session teardown: unindex tabs, delete session entry,
 			// AND close the backing context (only when generation is known).
 			// When the pool entry is missing, session/tab records are still
 			// cleaned up so findTabById stops returning stale Page objects,
 			// but no context close is attempted (HIGH B).
 			//
-			// Lazy import to avoid circular dependency with session.ts.
-			const { teardownSessionByKey } = await import('./session');
-			await teardownSessionByKey(normalizedProfile, generation);
+			// The session snapshot is passed through so teardownSessionByKey
+			// can validate the session owner (foreign-ownership fail-closed)
+			// and the session generation (replacement race prevention).
+			await teardownSessionByKey(normalizedProfile, generation, sessionSnapshot);
 
 			return;
 		}
