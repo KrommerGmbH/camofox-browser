@@ -1,4 +1,3 @@
-import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { type ChildProcess, spawn } from 'node:child_process';
@@ -14,6 +13,8 @@ import { type Fingerprint } from 'fingerprint-generator';
 import { firefox, type BrowserContext, type BrowserContextOptions } from 'playwright-core';
 
 import { loadConfig } from '../utils/config';
+import { assertBrowserPlatformSupported, getHostArchitecture, getHostOS } from '../utils/platform-support';
+import { resolveProfileDirForProfileKey } from '../utils/profile-path';
 import { readVersionedSidecar, writeVersionedSidecar } from '../utils/sidecar-version';
 import { log } from '../middleware/logging';
 import type { ResolvedProxyConfig } from '../types';
@@ -32,18 +33,12 @@ export interface PoolEntry {
 	lastAccess: number;
 	createdAt: number;  // Timestamp when this entry was created
 	launching?: Promise<BrowserContext>;
+	closing?: Promise<void>;
 	staged?: boolean;
 	stagedGeneration?: string;
 	virtualDisplay?: any;
 	proxyConfig?: ResolvedProxyConfig | null;
 	seedOptions?: Pick<BrowserContextOptions, 'locale' | 'timezoneId' | 'geolocation' | 'viewport'>;
-}
-
-function getHostOS(): 'macos' | 'windows' | 'linux' {
-	const platform = os.platform();
-	if (platform === 'darwin') return 'macos';
-	if (platform === 'win32') return 'windows';
-	return 'linux';
 }
 
 function buildProxyConfig(proxy?: ResolvedProxyConfig | null): { server: string; username?: string; password?: string } | null {
@@ -70,38 +65,6 @@ function getInstalledCamoufoxVersion(): string {
 	} catch {
 		return 'unknown';
 	}
-}
-
-function decodeDefaultProfileUserId(profileKey: string): string | null {
-	if (!profileKey.startsWith('u:') || profileKey.indexOf(':', 2) !== -1) return null;
-	try {
-		const encoded = profileKey.slice(2);
-		const bytes = Buffer.from(encoded, 'base64url');
-		if (bytes.length % 2 !== 0) return null;
-		const decoded = bytes.toString('utf16le');
-		if (/^(?:u|s|p|o):/.test(decoded)) return null;
-		for (let i = 0; i < decoded.length; i += 1) {
-			const code = decoded.charCodeAt(i);
-			if (code >= 0xd800 && code <= 0xdbff) {
-				if (i + 1 >= decoded.length) return null;
-				const next = decoded.charCodeAt(i + 1);
-				if (next < 0xdc00 || next > 0xdfff) return null;
-				i += 1;
-			} else if (code >= 0xdc00 && code <= 0xdfff) {
-				return null;
-			}
-		}
-		return `u:${Buffer.from(decoded, 'utf16le').toString('base64url')}` === profileKey ? decoded : null;
-	} catch {
-		return null;
-	}
-}
-
-function profileDirForProfileKey(profileKey: string): string {
-	// Avoid path traversal from untrusted route params.
-	const defaultUserId = decodeDefaultProfileUserId(String(profileKey));
-	const safe = encodeURIComponent(defaultUserId ?? String(profileKey));
-	return path.join(CONFIG.profilesDir, safe);
 }
 
 function pickSeedOptions(opts?: BrowserContextOptions): PoolEntry['seedOptions'] | undefined {
@@ -376,8 +339,9 @@ export class ContextPool {
 		const hostOS = getHostOS();
 		const proxy = buildProxyConfig(resolvedProxy);
 		const headless = this.headlessOverrides.get(userId) ?? CONFIG.headless;
+		assertBrowserPlatformSupported(hostOS, getHostArchitecture(), headless);
 
-		const profileDir = profileDirForProfileKey(profileKey);
+		const profileDir = resolveProfileDirForProfileKey(CONFIG.profilesDir, profileKey);
 		fs.mkdirSync(profileDir, { recursive: true });
 		const compatPath = path.join(profileDir, 'compatibility.json');
 
@@ -584,7 +548,7 @@ export class ContextPool {
 
 		let lru: PoolEntry | null = null;
 		for (const entry of this.pool.values()) {
-			if (entry.launching || entry.staged) continue;
+			if (entry.launching || entry.closing || entry.staged) continue;
 			if (!lru || entry.lastAccess < lru.lastAccess) lru = entry;
 		}
 		if (!lru) return;
@@ -605,6 +569,15 @@ export class ContextPool {
 		const normalized = String(userId);
 		let entry = this.pool.get(profileKey);
 		const seed = pickSeedOptions(options);
+
+		if (entry?.closing) {
+			// Never hand out a context once shutdown has started. A request can
+			// pass the lifecycle idle-closure check immediately before cleanup
+			// begins closing the pool entry; wait for that exact close to finish,
+			// then re-read the pool and relaunch if needed.
+			await entry.closing;
+			entry = this.pool.get(profileKey);
+		}
 
 		if (entry) {
 			if (staged) {
@@ -641,7 +614,7 @@ export class ContextPool {
 			return entry;
 		}
 
-		const profileDir = profileDirForProfileKey(profileKey);
+		const profileDir = resolveProfileDirForProfileKey(CONFIG.profilesDir, profileKey);
 		const newEntry: PoolEntry = {
 			context: null as unknown as BrowserContext,
 			userId: normalized,
@@ -686,24 +659,31 @@ export class ContextPool {
 		const normalized = String(profileKey);
 		const entry = this.pool.get(normalized);
 		if (!entry || entry.staged) return;
-
-		try {
-			if (entry.launching) {
-				await entry.launching.catch(() => {});
-				entry.launching = undefined;
-			}
-			await entry.context?.close().catch(() => {});
-		} finally {
-			this.cleanupVirtualDisplay(entry);
-			// Only delete if this entry is still in the pool (avoid deleting a newer entry with same key)
-			const currentEntry = this.pool.get(normalized);
-			if (currentEntry === entry) {
-				this.pool.delete(normalized);
-				log('info', 'persistent context removed from pool', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
-			} else {
-				log('info', 'persistent context closed but newer entry exists', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
-			}
+		if (entry.closing) {
+			await entry.closing;
+			return;
 		}
+
+		entry.closing = (async () => {
+			try {
+				if (entry.launching) {
+					await entry.launching.catch(() => {});
+					entry.launching = undefined;
+				}
+				await entry.context?.close().catch(() => {});
+			} finally {
+				this.cleanupVirtualDisplay(entry);
+				// Only delete if this entry is still in the pool (avoid deleting a newer entry with same key)
+				const currentEntry = this.pool.get(normalized);
+				if (currentEntry === entry) {
+					this.pool.delete(normalized);
+					log('info', 'persistent context removed from pool', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
+				} else {
+					log('info', 'persistent context closed but newer entry exists', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
+				}
+			}
+		})();
+		await entry.closing;
 	}
 
 	async closeContextIfMatches(profileKey: string, expectedCreatedAt: number, expectedLastAccess?: number): Promise<void> {

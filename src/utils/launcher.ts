@@ -36,7 +36,7 @@ export function launchServer({ pluginDir, port, env, log }: LaunchServerOptions)
   if (!serverPath) {
     throw new Error('Server entrypoint not found. Run `npm run build` to generate dist/src/server.js.');
   }
-  const proc = startProcess('node', [serverPath], {
+  const proc = startProcess(process.execPath, [serverPath], {
     cwd: pluginDir,
     env: {
       ...env,

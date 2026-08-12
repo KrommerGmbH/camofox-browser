@@ -9,6 +9,11 @@ import { log } from '../middleware/logging';
 import { isAuthorizedWithApiKey } from '../middleware/auth';
 import { checkRateLimit } from '../middleware/rate-limit';
 import { loadConfig } from '../utils/config';
+import {
+	assertBrowserPlatformSupported,
+	getHostArchitecture,
+	getHostOS,
+} from '../utils/platform-support';
 import { getAllPresets, resolveContextOptions, validateContextOptions } from '../utils/presets';
 import { contextPool, getDisplayForUser } from '../services/context-pool';
 import { lifecycleController } from '../services/lifecycle-controller';
@@ -1361,6 +1366,7 @@ router.post(
 					error: 'headless must be a boolean or "virtual"',
 				});
 			}
+			assertBrowserPlatformSupported(getHostOS(), getHostArchitecture(), headless);
 
 			const existingSessions = getSessionsForUser(userId);
 			const prewarmProfileKey = existingSessions.length === 1 ? existingSessions[0][0] : undefined;
@@ -1416,7 +1422,7 @@ router.post(
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			log('error', 'toggle display failed', { error: message });
-			return res.status(500).json({ error: safeError(err) });
+			return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 		}
 	},
 );

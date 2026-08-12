@@ -46,7 +46,7 @@ camofox snapshot --user acct-a
 - Pool key: normalized `userId`
 - Capacity: `CAMOFOX_MAX_SESSIONS` (default `50`)
 - Overflow policy: LRU eviction of least recently used non-launching context
-- Profile directory: `~/.camofox/profiles/<encodedUserId>`
+- Profile directory root: `~/.camofox/profiles/`; Linux/macOS retain readable default-user names and Windows uses collision-safe hashed internal keys, while unambiguous legacy Windows directories remain readable in place
 
 Operational details:
 

@@ -1,6 +1,6 @@
 {
   "name": "camofox-browser",
-  "version": "2.4.6",
+  "version": "2.4.7",
   "description": "Anti-detection browser server for AI agents — REST API wrapping Camoufox engine with OpenClaw plugin support",
   "type": "commonjs",
   "main": "dist/src/server.js",
@@ -45,7 +45,8 @@
     "openclaw.plugin.json",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE"
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.md"
   ],
   "openclaw": {
     "extensions": [
@@ -63,7 +64,8 @@
     "test:e2e": "jest --runInBand --detectOpenHandles tests/e2e",
     "test:live": "RUN_LIVE_TESTS=1 jest --runInBand --detectOpenHandles tests/live",
     "test:debug": "DEBUG_SERVER=1 jest --runInBand --detectOpenHandles",
-    "verify:package": "bash scripts/verify-package.sh",
+    "verify:package": "node scripts/verify-package.mjs",
+    "build:portable:windows": "node scripts/build-portable-windows.mjs",
     "postinstall": "npx camoufox-js fetch || true"
   },
   "dependencies": {
@@ -86,5 +88,8 @@
   },
   "optionalDependencies": {
     "argon2": "^0.41.1"
+  },
+  "overrides": {
+    "adm-zip": "0.6.0"
   }
 }

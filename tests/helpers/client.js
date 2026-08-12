@@ -105,14 +105,11 @@ class BrowserClient {
   }
   
   async type(tabId, options) {
-    const { pressEnter, clear, ...typeOptions } = options;
-    
-    // Handle clear by selecting all first
-    if (clear && (options.selector || options.ref)) {
-      // Click to focus, then select all and type to replace
-      await this.click(tabId, { selector: options.selector, ref: options.ref });
-      await this.press(tabId, 'Control+a');
-    }
+    const { pressEnter, clear: _clear, ...typeOptions } = options;
+    // The server-side /type path already uses replacement semantics (fill for
+    // inputs/textareas and select-all replacement for contenteditable). Keep
+    // `clear` as a backwards-compatible helper option, but do not add a
+    // separate click/Control+A step that can flake while the element is busy.
     
     const result = await this.request('POST', `/tabs/${tabId}/type`, { userId: this.userId, ...typeOptions });
     

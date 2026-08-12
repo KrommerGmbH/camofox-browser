@@ -42,7 +42,7 @@ Design implication:
 ## 2) Fingerprint Lifecycle
 
 For each `userId` context:
-1. Profile dir is resolved under `~/.camofox/profiles/<encoded-userId>`
+1. Profile dir is resolved under `~/.camofox/profiles/`; Linux/macOS keep the readable default-user directory name, while Windows uses collision-safe hashed internal profile keys (with a fail-closed read path for unambiguous legacy Windows directories)
 2. Fingerprint file path: `<profileDir>/fingerprint.json`
 3. If fingerprint exists and parses, it is reused
 4. Otherwise a new fingerprint is generated and persisted
@@ -141,6 +141,8 @@ Supported values:
 - `true` => headless
 - `false` => headed
 - `"virtual"` => virtual display mode
+
+Windows x64 support is headless-only. `false` and `"virtual"` are rejected before any Xvfb/VNC process is attempted. Native headed Windows mode is not part of the verified support contract.
 
 Linux fallback behavior:
 - If headed mode is requested and no usable display exists, Xvfb virtual display is spawned.

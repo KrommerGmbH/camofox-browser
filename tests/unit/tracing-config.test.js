@@ -1,13 +1,24 @@
 const path = require('node:path');
 
-const fallbackTracesDir = '/mock-home/.camofox/traces';
+const mockHome = path.resolve(path.sep, 'mock-home');
+const fallbackTracesDir = path.join(mockHome, '.camofox', 'traces');
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function tracePathMatcher() {
+  return expect.stringMatching(
+    new RegExp(`^${escapeRegExp(`${fallbackTracesDir}${path.sep}`)}.+-\\d+\\.zip$`),
+  );
+}
 
 jest.mock('../../dist/src/utils/config', () => ({
   loadConfig: () => ({ traceMaxDurationMs: 30_000 }),
 }));
 
 jest.mock('node:os', () => ({
-  homedir: () => '/mock-home',
+  homedir: () => mockHome,
 }));
 
 jest.mock('node:fs', () => ({
@@ -59,7 +70,7 @@ describe('tracing.ts config safety', () => {
 
     expect(fs.mkdirSync).toHaveBeenCalledWith(fallbackTracesDir, { recursive: true });
     expect(context.tracing.stop).toHaveBeenCalledWith({
-      path: expect.stringMatching(new RegExp(`^${fallbackTracesDir}/.+-\\d+\\.zip$`)),
+      path: tracePathMatcher(),
     });
     expect(path.dirname(result.path)).toBe(fallbackTracesDir);
     expect(getTracingState('user-a')).toEqual({
@@ -86,7 +97,7 @@ describe('tracing.ts config safety', () => {
 
     expect(fs.mkdirSync).toHaveBeenCalledWith(fallbackTracesDir, { recursive: true });
     expect(context.tracing.stopChunk).toHaveBeenCalledWith({
-      path: expect.stringMatching(new RegExp(`^${fallbackTracesDir}/.+-\\d+\\.zip$`)),
+      path: tracePathMatcher(),
     });
     expect(path.dirname(result.path)).toBe(fallbackTracesDir);
     expect(getTracingState('user-a')).toEqual({
@@ -192,7 +203,7 @@ describe('tracing.ts config safety', () => {
 
     resolveStop(undefined);
     await expect(stopPromise).resolves.toEqual({
-      path: expect.stringMatching(new RegExp(`^${fallbackTracesDir}/.+-\\d+\\.zip$`)),
+      path: tracePathMatcher(),
       size: 123,
     });
     expect(getTracingState('user-a')).toEqual({
@@ -239,7 +250,7 @@ describe('tracing.ts config safety', () => {
 
     resolveStopChunk(undefined);
     await expect(stopChunkPromise).resolves.toEqual({
-      path: expect.stringMatching(new RegExp(`^${fallbackTracesDir}/.+-\\d+\\.zip$`)),
+      path: tracePathMatcher(),
       size: 123,
     });
     await Promise.resolve();
@@ -278,11 +289,11 @@ describe('tracing.ts config safety', () => {
     resolveStopChunk(undefined);
     await expect(Promise.all([firstStopPromise, secondStopPromise])).resolves.toEqual([
       {
-        path: expect.stringMatching(new RegExp(`^${fallbackTracesDir}/.+-\\d+\\.zip$`)),
+        path: tracePathMatcher(),
         size: 123,
       },
       {
-        path: expect.stringMatching(new RegExp(`^${fallbackTracesDir}/.+-\\d+\\.zip$`)),
+        path: tracePathMatcher(),
         size: 123,
       },
     ]);

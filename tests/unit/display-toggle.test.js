@@ -1,6 +1,15 @@
 describe('display toggle route', () => {
+  function mockLinuxPlatformSupport() {
+    jest.doMock('../../dist/src/utils/platform-support', () => ({
+      assertBrowserPlatformSupported: jest.fn(),
+      getHostArchitecture: jest.fn().mockReturnValue('x64'),
+      getHostOS: jest.fn().mockReturnValue('linux'),
+    }));
+  }
+
   test('prewarms the existing profile-key context and returns VNC URL for virtual mode', async () => {
     jest.resetModules();
+    mockLinuxPlatformSupport();
 
     const closeSessionsForUser = jest.fn().mockResolvedValue(undefined);
     const restartContext = jest.fn().mockResolvedValue({});
@@ -171,6 +180,7 @@ describe('display toggle route', () => {
 
   test('derives prewarm settings from session profile when the pool entry was evicted', async () => {
     jest.resetModules();
+    mockLinuxPlatformSupport();
 
     const closeSessionsForUser = jest.fn().mockResolvedValue(undefined);
     const restartContext = jest.fn().mockResolvedValue({});
@@ -332,6 +342,7 @@ describe('display toggle route', () => {
 
   test('stores display override without closing sessions when multiple profile contexts are active', async () => {
     jest.resetModules();
+    mockLinuxPlatformSupport();
 
     const closeSessionsForUser = jest.fn().mockResolvedValue(undefined);
     const restartContext = jest.fn().mockResolvedValue({});

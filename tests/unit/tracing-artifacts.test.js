@@ -56,8 +56,8 @@ describe('tracing artifact helpers', () => {
     ]);
     fs.statSync.mockImplementation((artifactPath) => {
       const stats = {
-        [`${TRACES_DIR}/${userOneToken}-300.zip`]: { size: 300, mtimeMs: 3000 },
-        [`${TRACES_DIR}/${userOneToken}-200.zip`]: { size: 200, mtimeMs: 2000 },
+        [path.join(TRACES_DIR, `${userOneToken}-300.zip`)]: { size: 300, mtimeMs: 3000 },
+        [path.join(TRACES_DIR, `${userOneToken}-200.zip`)]: { size: 200, mtimeMs: 2000 },
       };
       return stats[artifactPath];
     });
@@ -86,8 +86,8 @@ describe('tracing artifact helpers', () => {
     ]);
     fs.statSync.mockImplementation((artifactPath) => {
       const stats = {
-        [`${TRACES_DIR}/${legacyOddLegacyUserToken}-100.zip`]: { size: 100, mtimeMs: 1000 },
-        [`${TRACES_DIR}/${oddLegacyUserToken}-200.zip`]: { size: 200, mtimeMs: 2000 },
+        [path.join(TRACES_DIR, `${legacyOddLegacyUserToken}-100.zip`)]: { size: 100, mtimeMs: 1000 },
+        [path.join(TRACES_DIR, `${oddLegacyUserToken}-200.zip`)]: { size: 200, mtimeMs: 2000 },
       };
       return stats[artifactPath];
     });
@@ -111,7 +111,7 @@ describe('tracing artifact helpers', () => {
     ]);
     fs.statSync.mockImplementation((artifactPath) => {
       const stats = {
-        [`${TRACES_DIR}/${victimToken}-100.zip`]: { size: 100, mtimeMs: 1000 },
+        [path.join(TRACES_DIR, `${victimToken}-100.zip`)]: { size: 100, mtimeMs: 1000 },
       };
       return stats[artifactPath];
     });
@@ -141,9 +141,9 @@ describe('tracing artifact helpers', () => {
     ]);
     fs.statSync.mockImplementation((artifactPath) => {
       const stats = {
-        [`${TRACES_DIR}/${loneToken}-100.zip`]: { size: 100, mtimeMs: 1000 },
-        [`${TRACES_DIR}/${replacementToken}-200.zip`]: { size: 200, mtimeMs: 2000 },
-        [`${TRACES_DIR}/${legacyCollisionToken}-300.zip`]: { size: 300, mtimeMs: 3000 },
+        [path.join(TRACES_DIR, `${loneToken}-100.zip`)]: { size: 100, mtimeMs: 1000 },
+        [path.join(TRACES_DIR, `${replacementToken}-200.zip`)]: { size: 200, mtimeMs: 2000 },
+        [path.join(TRACES_DIR, `${legacyCollisionToken}-300.zip`)]: { size: 300, mtimeMs: 3000 },
       };
       return stats[artifactPath];
     });
@@ -162,7 +162,7 @@ describe('tracing artifact helpers', () => {
       'Trace artifact does not belong to this user',
     );
     expect(deleteTraceArtifact(loneSurrogate, `${loneToken}-100.zip`)).toBe(true);
-    expect(fs.unlinkSync).toHaveBeenCalledWith(`${TRACES_DIR}/${loneToken}-100.zip`);
+    expect(fs.unlinkSync).toHaveBeenCalledWith(path.join(TRACES_DIR, `${loneToken}-100.zip`));
   });
 
   test('listTraceArtifacts() skips entries that vanish before stat', () => {
@@ -171,7 +171,7 @@ describe('tracing artifact helpers', () => {
       { name: `${userOneToken}-200.zip`, isFile: () => true },
     ]);
     fs.statSync.mockImplementation((artifactPath) => {
-      if (artifactPath === `${TRACES_DIR}/${userOneToken}-100.zip`) {
+      if (artifactPath === path.join(TRACES_DIR, `${userOneToken}-100.zip`)) {
         const err = new Error('gone');
         err.code = 'ENOENT';
         throw err;
@@ -206,7 +206,7 @@ describe('tracing artifact helpers', () => {
     );
 
     expect(deleteTraceArtifact('user/one', `${userOneToken}-1.zip`)).toBe(true);
-    expect(fs.unlinkSync).toHaveBeenCalledWith(`${TRACES_DIR}/${userOneToken}-1.zip`);
+    expect(fs.unlinkSync).toHaveBeenCalledWith(path.join(TRACES_DIR, `${userOneToken}-1.zip`));
   });
 
   test('ownership checks reject tokens that merely share a prefix', () => {
@@ -216,8 +216,8 @@ describe('tracing artifact helpers', () => {
     ]);
     fs.statSync.mockImplementation((artifactPath) => {
       const stats = {
-        [`${TRACES_DIR}/${prefixUserToken}-100.zip`]: { size: 100, mtimeMs: 1000 },
-        [`${TRACES_DIR}/${prefixedUserToken}-200.zip`]: { size: 200, mtimeMs: 2000 },
+        [path.join(TRACES_DIR, `${prefixUserToken}-100.zip`)]: { size: 100, mtimeMs: 1000 },
+        [path.join(TRACES_DIR, `${prefixedUserToken}-200.zip`)]: { size: 200, mtimeMs: 2000 },
       };
       return stats[artifactPath];
     });
@@ -262,9 +262,9 @@ describe('tracing artifact helpers', () => {
     const result = await stopTracing('user/one', context, `${mockTracesDir}/`);
 
     expect(path.dirname(result.path)).toBe(mockTracesDir);
-    expect(context.tracing.stop).toHaveBeenCalledWith({
-      path: expect.stringMatching(new RegExp(`^${mockTracesDir}/${userOneToken}-\\d+\\.zip$`)),
-    });
+    const stopPath = context.tracing.stop.mock.calls[0][0].path;
+    expect(path.dirname(stopPath)).toBe(mockTracesDir);
+    expect(path.basename(stopPath)).toMatch(new RegExp(`^${userOneToken}-\\d+\\.zip$`));
   });
 
   test('trace download returns JSON when the file stream errors before sending bytes', async () => {
