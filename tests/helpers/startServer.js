@@ -122,6 +122,10 @@ function getServerPort() {
   return serverPort;
 }
 
+function getServerPid() {
+  return serverProcess?.pid ?? null;
+}
+
 function getServerLogs() {
   return [...serverLogs];
 }
@@ -135,6 +139,7 @@ module.exports = {
   stopServer,
   getServerUrl,
   getServerPort,
+  getServerPid,
   getServerLogs,
   clearServerLogs
 };

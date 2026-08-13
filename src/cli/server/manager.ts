@@ -204,10 +204,7 @@ export class ServerManager {
 	}
 
 	private async delay(ms: number): Promise<void> {
-		await new Promise<void>((resolve) => {
-			const timer = setTimeout(() => resolve(), ms);
-			timer.unref();
-		});
+		await new Promise<void>((resolve) => setTimeout(resolve, ms));
 	}
 
 	private async isPortInUse(port: number): Promise<boolean> {

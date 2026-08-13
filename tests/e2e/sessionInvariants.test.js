@@ -3,8 +3,9 @@ const crypto = require('crypto');
 const path = require('path');
 const { promisify } = require('util');
 
-const { startServer, stopServer, getServerUrl } = require('../helpers/startServer');
+const { startServer, stopServer, getServerUrl, getServerPid } = require('../helpers/startServer');
 const { startTestSite, stopTestSite, getTestSiteUrl } = require('../helpers/testSite');
+const { resetTestStateDirectories } = require('../helpers/test-state-reset');
 
 const execFileAsync = promisify(execFile);
 
@@ -75,9 +76,52 @@ async function deleteSession(serverUrl, userId) {
   return { res, data };
 }
 
+async function getWindowsCamoufoxProcessIds() {
+  if (process.platform !== 'win32') return [];
+  const { stdout = '' } = await execFileAsync('tasklist.exe', [
+    '/FI', 'IMAGENAME eq camoufox.exe',
+    '/FO', 'CSV',
+    '/NH',
+  ]);
+  return stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('"camoufox.exe"'))
+    .map((line) => Number(line.split(',')[1]?.replaceAll('"', '')))
+    .filter(Number.isFinite);
+}
+
+async function waitForNoNewWindowsCamoufoxProcesses(baselineProcessIds, timeoutMs = 10000) {
+  if (process.platform !== 'win32') return [];
+  const deadline = Date.now() + timeoutMs;
+  let processIds = [];
+  while (Date.now() < deadline) {
+    processIds = (await getWindowsCamoufoxProcessIds())
+      .filter((processId) => !baselineProcessIds.has(processId));
+    if (processIds.length === 0) return processIds;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return processIds;
+}
+
+async function getWindowsServerResourceSummary() {
+  if (process.platform !== 'win32') return null;
+  const pid = getServerPid();
+  if (!pid) return null;
+  const command = [
+    `$p = Get-Process -Id ${pid} -ErrorAction Stop;`,
+    '$p | Select-Object Id,Handles,WorkingSet64,PrivateMemorySize64 | ConvertTo-Json -Compress',
+  ].join(' ');
+  const { stdout = '' } = await execFileAsync('powershell.exe', [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command,
+  ]);
+  return stdout.trim();
+}
+
 describe('Session invariants', () => {
   let serverUrl;
   let testSiteUrl;
+  let baselineWindowsCamoufoxProcessIds = new Set();
   const cleanupUsers = new Set();
 
   function trackUser(prefix) {
@@ -87,6 +131,7 @@ describe('Session invariants', () => {
   }
 
   beforeAll(async () => {
+    baselineWindowsCamoufoxProcessIds = new Set(await getWindowsCamoufoxProcessIds());
     await startServer(0, { CAMOFOX_MAX_SESSIONS: '1', CAMOFOX_API_KEY: '' });
     serverUrl = getServerUrl();
     await startTestSite();
@@ -97,7 +142,21 @@ describe('Session invariants', () => {
     for (const userId of cleanupUsers) {
       await deleteSession(serverUrl, userId).catch(() => {});
     }
+    await waitForPoolSize(serverUrl, 0, 15000);
+    const leakedProcessIds = await waitForNoNewWindowsCamoufoxProcesses(baselineWindowsCamoufoxProcessIds);
+    if (leakedProcessIds.length > 0) {
+      throw new Error(`Camoufox processes remained after pool cleanup: ${leakedProcessIds.join(',')}`);
+    }
+    resetTestStateDirectories([
+      'CAMOFOX_PROFILES_DIR',
+      'CAMOFOX_COOKIES_DIR',
+      'CAMOFOX_DOWNLOADS_DIR',
+      'CAMOFOX_TRACES_DIR',
+    ]);
     cleanupUsers.clear();
+    if (process.platform === 'win32') {
+      console.log(`windows-resource-after:${expect.getState().currentTestName}:${await getWindowsServerResourceSummary()}`);
+    }
   });
 
   afterAll(async () => {

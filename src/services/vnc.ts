@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 
 import { log } from '../middleware/logging';
 import { loadConfig } from '../utils/config';
+import { assertDisplayModeSupported, getHostOS } from '../utils/platform-support';
 
 interface VncSession {
 	userId: string;
@@ -60,6 +61,7 @@ export async function startVnc(
 	vncUrl: string;
 	wsPort: number;
 }> {
+	assertDisplayModeSupported(getHostOS(), 'virtual');
 	const normalizedUserId = String(userId);
 	const normalizedDisplay = normalizeDisplay(displayNum);
 

@@ -6,11 +6,41 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
-  docker:
+  release-contract:
     runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Verify tag and package release identity
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          PLUGIN_VERSION=$(node -p "require('./openclaw.plugin.json').version")
+          EXPECTED_TAG="v${VERSION}"
+          test "$GITHUB_REF_NAME" = "$EXPECTED_TAG"
+          test "$PLUGIN_VERSION" = "$VERSION"
+          grep -F "## [${VERSION}]" CHANGELOG.md >/dev/null
+
+  ci:
+    needs: release-contract
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  docker:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
     steps:
       - uses: actions/checkout@v5
 
@@ -37,3 +67,29 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+
+  github-release:
+    needs: [ci, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download verified portable ZIP
+        uses: actions/download-artifact@v8
+        with:
+          name: camofox-browser-windows-x64
+          path: release-artifacts
+
+      - name: Publish portable ZIP to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ZIP=$(find release-artifacts -type f -name 'camofox-browser-*-windows-x64.zip' -print -quit)
+          test -n "$ZIP"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$ZIP" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$ZIP" --repo "$GITHUB_REPOSITORY" --generate-notes --title "camofox-browser $GITHUB_REF_NAME"
+          fi

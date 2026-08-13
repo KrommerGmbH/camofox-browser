@@ -295,4 +295,20 @@ describe('server exposure config safety', () => {
     expect(config.serverEnv.CAMOFOX_SCREEN_HEIGHT).toBe('720');
     expect(config.serverEnv.CAMOFOX_HUMANIZE).toBe('true');
   });
+
+  test('forwards Windows portable home variables through serverEnv', () => {
+    const { loadConfig } = require('../../dist/src/utils/config');
+
+    const config = loadConfig({
+      HOME: 'C:\\portable\\data\\home',
+      USERPROFILE: 'C:\\portable\\data\\home',
+      APPDATA: 'C:\\portable\\data\\home\\AppData\\Roaming',
+      LOCALAPPDATA: 'C:\\portable\\data\\home\\AppData\\Local',
+    });
+
+    expect(config.serverEnv.HOME).toBe('C:\\portable\\data\\home');
+    expect(config.serverEnv.USERPROFILE).toBe('C:\\portable\\data\\home');
+    expect(config.serverEnv.APPDATA).toBe('C:\\portable\\data\\home\\AppData\\Roaming');
+    expect(config.serverEnv.LOCALAPPDATA).toBe('C:\\portable\\data\\home\\AppData\\Local');
+  });
 });

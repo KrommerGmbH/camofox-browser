@@ -108,11 +108,19 @@ describe('Session profile context isolation', () => {
     expect(beta.data.tabId).toBeDefined();
 
     const profileDirs = fs
-      .readdirSync(profilesDir)
-      .map((entry) => decodeURIComponent(entry))
-      .filter((entry) => entry.startsWith(`p:${encodeKeyComponent(userId)}:`));
+      .readdirSync(profilesDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
     expect(profileDirs).toHaveLength(2);
-    expect(profileDirs.some((entry) => entry.includes(`:${encodeKeyComponent('alpha')}:`))).toBe(true);
-    expect(profileDirs.some((entry) => entry.includes(`:${encodeKeyComponent('beta')}:`))).toBe(true);
+    expect(new Set(profileDirs).size).toBe(2);
+
+    if (process.platform === 'win32') {
+      expect(profileDirs.every((entry) => /^profile-[0-9a-f]{64}$/.test(entry))).toBe(true);
+    } else {
+      const decodedProfileDirs = profileDirs.map((entry) => decodeURIComponent(entry));
+      expect(decodedProfileDirs.every((entry) => entry.startsWith(`p:${encodeKeyComponent(userId)}:`))).toBe(true);
+      expect(decodedProfileDirs.some((entry) => entry.includes(`:${encodeKeyComponent('alpha')}:`))).toBe(true);
+      expect(decodedProfileDirs.some((entry) => entry.includes(`:${encodeKeyComponent('beta')}:`))).toBe(true);
+    }
   }, 120000);
 });

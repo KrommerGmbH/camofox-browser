@@ -5,12 +5,15 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         node-version: [20, 22]
 
     steps:
@@ -33,3 +36,61 @@ jobs:
 
       - name: Test
         run: npm test
+
+      - name: Verify package contract
+        if: matrix.node-version == 22
+        run: npm run verify:package
+
+      - name: Audit production dependencies
+        if: matrix.node-version == 22
+        run: npm audit --omit=dev --audit-level=moderate
+
+  windows-portable:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install build dependencies
+        run: npm ci
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+
+      - name: Build portable Windows x64 ZIP
+        run: npm run build:portable:windows
+
+      - name: Verify extracted portable runtime from path with spaces
+        id: portable
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -Path 'build/portable-windows' -Filter 'camofox-browser-*-windows-x64.zip' | Select-Object -First 1
+          if (-not $zip) { throw 'Portable Windows ZIP was not produced.' }
+
+          $extractRoot = Join-Path $env:RUNNER_TEMP 'Portable Package'
+          if (Test-Path $extractRoot) { Remove-Item -Recurse -Force $extractRoot }
+          New-Item -ItemType Directory -Path $extractRoot | Out-Null
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $extractRoot
+
+          $bundle = Get-ChildItem -Path $extractRoot -Directory | Select-Object -First 1
+          if (-not $bundle) { throw 'Portable Windows ZIP did not contain a bundle directory.' }
+
+          $bundledNode = Join-Path $bundle.FullName 'node\node.exe'
+          & $bundledNode (Join-Path $env:GITHUB_WORKSPACE 'scripts\verify-portable-windows.mjs') $bundle.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          "zip_path=$($zip.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload verified portable ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: camofox-browser-windows-x64
+          path: ${{ steps.portable.outputs.zip_path }}
+          if-no-files-found: error
+          compression-level: 0

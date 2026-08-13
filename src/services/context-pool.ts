@@ -1,7 +1,7 @@
-import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { type ChildProcess, spawn } from 'node:child_process';
+import { type Readable } from 'node:stream';
 
 import { launchOptions } from 'camoufox-js';
 import { generateFingerprint } from 'camoufox-js/dist/fingerprints.js';
@@ -13,6 +13,8 @@ import { type Fingerprint } from 'fingerprint-generator';
 import { firefox, type BrowserContext, type BrowserContextOptions } from 'playwright-core';
 
 import { loadConfig } from '../utils/config';
+import { assertBrowserPlatformSupported, getHostArchitecture, getHostOS } from '../utils/platform-support';
+import { resolveProfileDirForProfileKey } from '../utils/profile-path';
 import { readVersionedSidecar, writeVersionedSidecar } from '../utils/sidecar-version';
 import { log } from '../middleware/logging';
 
@@ -32,18 +34,12 @@ export interface PoolEntry {
 	lastAccess: number;
 	createdAt: number;  // Timestamp when this entry was created
 	launching?: Promise<BrowserContext>;
+	closing?: Promise<void>;
 	staged?: boolean;
 	stagedGeneration?: string;
 	virtualDisplay?: any;
 	proxyConfig?: ResolvedProxyConfig | null;
 	seedOptions?: Pick<BrowserContextOptions, 'locale' | 'timezoneId' | 'geolocation' | 'viewport'>;
-}
-
-function getHostOS(): 'macos' | 'windows' | 'linux' {
-	const platform = os.platform();
-	if (platform === 'darwin') return 'macos';
-	if (platform === 'win32') return 'windows';
-	return 'linux';
 }
 
 function buildProxyConfig(proxy?: ResolvedProxyConfig | null): { server: string; username?: string; password?: string } | null {
@@ -72,38 +68,6 @@ function getInstalledCamoufoxVersion(): string {
 	}
 }
 
-function decodeDefaultProfileUserId(profileKey: string): string | null {
-	if (!profileKey.startsWith('u:') || profileKey.indexOf(':', 2) !== -1) return null;
-	try {
-		const encoded = profileKey.slice(2);
-		const bytes = Buffer.from(encoded, 'base64url');
-		if (bytes.length % 2 !== 0) return null;
-		const decoded = bytes.toString('utf16le');
-		if (/^(?:u|s|p|o):/.test(decoded)) return null;
-		for (let i = 0; i < decoded.length; i += 1) {
-			const code = decoded.charCodeAt(i);
-			if (code >= 0xd800 && code <= 0xdbff) {
-				if (i + 1 >= decoded.length) return null;
-				const next = decoded.charCodeAt(i + 1);
-				if (next < 0xdc00 || next > 0xdfff) return null;
-				i += 1;
-			} else if (code >= 0xdc00 && code <= 0xdfff) {
-				return null;
-			}
-		}
-		return `u:${Buffer.from(decoded, 'utf16le').toString('base64url')}` === profileKey ? decoded : null;
-	} catch {
-		return null;
-	}
-}
-
-function profileDirForProfileKey(profileKey: string): string {
-	// Avoid path traversal from untrusted route params.
-	const defaultUserId = decodeDefaultProfileUserId(String(profileKey));
-	const safe = encodeURIComponent(defaultUserId ?? String(profileKey));
-	return path.join(CONFIG.profilesDir, safe);
-}
-
 function pickSeedOptions(opts?: BrowserContextOptions): PoolEntry['seedOptions'] | undefined {
 	if (!opts) return undefined;
 	const { locale, timezoneId, geolocation, viewport } = opts;
@@ -130,60 +94,155 @@ function hasUsableLinuxDisplay(): boolean {
 }
 
 async function spawnXvfb(resolution: string = '1920x1080x24'): Promise<{ display: string; process: ChildProcess }> {
-	let displayNum = 99;
-	while (fs.existsSync(`/tmp/.X${displayNum}-lock`)) {
-		displayNum++;
-	}
-
-	const display = `:${displayNum}`;
+	// Use -displayfd so Xvfb itself picks a free display number atomically.
+	// This avoids the userspace race condition where multiple concurrent
+	// spawnXvfb() calls all see the same absence of a lock file and pick
+	// the same display number — only the first to create the lock succeeds,
+	// the others exit with code 1.
+	//
+	// Xvfb writes "<display>\n" to fd 3 (e.g. "99\n"), which we read to
+	// determine the assigned display. This is the same approach used by
+	// camoufox-js's VirtualDisplay class (apify/camoufox-js#273).
+	//
+	// The fd3 output is line-delimited. We buffer until a newline is
+	// received and parse the complete record, rather than matching
+	// digits greedily — chunked writes could deliver a partial number
+	// (e.g. "9" then "9\n") that would be accepted prematurely.
 	const xvfbProcess = spawn('Xvfb', [
-		display,
-		'-screen',
-		'0',
-		resolution,
-		'-ac',
-		'-nolisten',
-		'tcp',
-	], { stdio: 'pipe' });
+		'-displayfd', '3',
+		'-screen', '0', resolution,
+		'-ac', '-nolisten', 'tcp',
+	], {
+		stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
+	});
 
-	await new Promise<void>((resolve, reject) => {
+	// Idempotent child cleanup — safe to call multiple times from any
+	// error path (timeout, spawn error, fd3 error/close).
+	// SIGTERM first, then SIGKILL after 3s if still alive.
+	// When the child has already exited (childExited=true), cleanupChild()
+	// is a no-op — no SIGTERM to a dead process, no new escalation timer.
+	let childCleaned = false;
+	let childExited = false;
+	let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
+	const cleanupChild = () => {
+		if (childCleaned) return;
+		childCleaned = true;
+		if (childExited) return;
+		try {
+			xvfbProcess.kill('SIGTERM');
+		} catch {
+			// already dead
+		}
+		sigkillTimer = setTimeout(() => {
+			sigkillTimer = null;
+			try {
+				xvfbProcess.kill('SIGKILL');
+			} catch {
+				// already dead
+			}
+		}, 3000);
+		sigkillTimer.unref();
+	};
+
+	// Mark child as exited and cancel any pending SIGKILL escalation timer.
+	// Called from the exit handler and the error handler (error often
+	// precedes or accompanies exit). After this, cleanupChild() will not
+	// send signals to the already-dead process.
+	const onChildExit = () => {
+		childExited = true;
+		if (sigkillTimer) {
+			clearTimeout(sigkillTimer);
+			sigkillTimer = null;
+		}
+	};
+
+	const display = await new Promise<string>((resolve, reject) => {
 		let settled = false;
-		const finalizeResolve = () => {
+		const finalize = (fn: () => void) => {
 			if (settled) return;
 			settled = true;
-			clearInterval(check);
 			clearTimeout(timeout);
-			resolve();
-		};
-		const finalizeReject = (err: Error) => {
-			if (settled) return;
-			settled = true;
-			clearInterval(check);
-			clearTimeout(timeout);
-			reject(err);
+			fn();
 		};
 
 		const timeout = setTimeout(() => {
-			finalizeReject(new Error('Xvfb start timeout'));
+			cleanupChild();
+			finalize(() => reject(new Error('Xvfb start timeout')));
 		}, 5000);
 
-		const check = setInterval(() => {
-			if (fs.existsSync(`/tmp/.X${displayNum}-lock`)) {
-				finalizeResolve();
+		const fd3 = xvfbProcess.stdio[3] as Readable;
+		let buf = '';
+
+		fd3.on('data', (chunk: Buffer | string) => {
+			buf += chunk.toString();
+			// Process ALL complete newline-delimited records currently in
+			// the buffer. A single data event may contain multiple records
+			// (e.g. "\n44\n" or "invalid\n44\n"). We loop through each
+			// complete record, skip malformed/blank lines, and resolve on
+			// the first valid display number. Any remaining incomplete data
+			// stays in buf for the next data event.
+			for (;;) {
+				const newlineIdx = buf.indexOf('\n');
+				if (newlineIdx === -1) break;
+				const line = buf.slice(0, newlineIdx).trim();
+				buf = buf.slice(newlineIdx + 1);
+				// Skip blank or malformed records — Xvfb may emit leading
+				// newlines or debug output before the display number.
+				const match = line.match(/^(\d+)$/);
+				if (match) {
+					finalize(() => resolve(`:${match[1]}`));
+					return;
+				}
 			}
-		}, 100);
+		});
 
 		xvfbProcess.once('error', (err) => {
-			finalizeReject(err);
+			cleanupChild();
+			onChildExit();
+			finalize(() => reject(err));
 		});
 
 		xvfbProcess.once('exit', (code, signal) => {
-			finalizeReject(new Error(`Xvfb exited early (code=${code ?? 'null'}, signal=${signal ?? 'null'})`));
+			onChildExit();
+			finalize(() => reject(new Error(`Xvfb exited early (code=${code ?? 'null'}, signal=${signal ?? 'null'})`)));
+		});
+
+		// fd3 may close before data arrives (e.g. Xvfb exits immediately).
+		fd3.once('end', () => {
+			if (!settled) {
+				cleanupChild();
+				finalize(() => reject(new Error('Xvfb fd3 closed before writing display number')));
+			}
+		});
+
+		// fd3 stream error — route through the same finalizer to avoid
+		// unhandled stream errors. Guard with `!settled` so that a late
+		// fd3 error after successful startup does not terminate a healthy
+		// Xvfb child (same guard as the end/close handlers).
+		fd3.once('error', (err) => {
+			if (!settled) {
+				cleanupChild();
+				finalize(() => reject(new Error(`Xvfb fd3 stream error: ${err instanceof Error ? err.message : String(err)}`)));
+			}
+		});
+
+		// fd3 closed without end event — the pipe is fully destroyed.
+		// Reject immediately rather than waiting for the 5s timeout.
+		fd3.once('close', () => {
+			if (!settled) {
+				cleanupChild();
+				finalize(() => reject(new Error('Xvfb fd3 stream closed before writing display number')));
+			}
 		});
 	});
 
 	return { display, process: xvfbProcess };
 }
+
+// Test-only export of spawnXvfb for unit testing the fd3 parser and
+// child cleanup logic without a real Xvfb binary. Not part of the
+// public API; consumed by tests/unit/spawn-xvfb-displayfd.test.js.
+export const spawnXvfbForTests = spawnXvfb;
 
 export class ContextPool {
 	private pool: Map<string, PoolEntry> = new Map();
@@ -281,8 +340,9 @@ export class ContextPool {
 		const hostOS = getHostOS();
 		const proxy = buildProxyConfig(resolvedProxy);
 		const headless = this.headlessOverrides.get(userId) ?? CONFIG.headless;
+		assertBrowserPlatformSupported(hostOS, getHostArchitecture(), headless);
 
-		const profileDir = profileDirForProfileKey(profileKey);
+		const profileDir = resolveProfileDirForProfileKey(CONFIG.profilesDir, profileKey);
 		fs.mkdirSync(profileDir, { recursive: true });
 		const compatPath = path.join(profileDir, 'compatibility.json');
 
@@ -489,7 +549,7 @@ export class ContextPool {
 
 		let lru: PoolEntry | null = null;
 		for (const entry of this.pool.values()) {
-			if (entry.launching || entry.staged) continue;
+			if (entry.launching || entry.closing || entry.staged) continue;
 			if (!lru || entry.lastAccess < lru.lastAccess) lru = entry;
 		}
 		if (!lru) return;
@@ -510,6 +570,15 @@ export class ContextPool {
 		const normalized = String(userId);
 		let entry = this.pool.get(profileKey);
 		const seed = pickSeedOptions(options);
+
+		if (entry?.closing) {
+			// Never hand out a context once shutdown has started. A request can
+			// pass the lifecycle idle-closure check immediately before cleanup
+			// begins closing the pool entry; wait for that exact close to finish,
+			// then re-read the pool and relaunch if needed.
+			await entry.closing;
+			entry = this.pool.get(profileKey);
+		}
 
 		if (entry) {
 			if (staged) {
@@ -546,7 +615,7 @@ export class ContextPool {
 			return entry;
 		}
 
-		const profileDir = profileDirForProfileKey(profileKey);
+		const profileDir = resolveProfileDirForProfileKey(CONFIG.profilesDir, profileKey);
 		const newEntry: PoolEntry = {
 			context: null as unknown as BrowserContext,
 			userId: normalized,
@@ -591,24 +660,31 @@ export class ContextPool {
 		const normalized = String(profileKey);
 		const entry = this.pool.get(normalized);
 		if (!entry || entry.staged) return;
-
-		try {
-			if (entry.launching) {
-				await entry.launching.catch(() => {});
-				entry.launching = undefined;
-			}
-			await entry.context?.close().catch(() => {});
-		} finally {
-			this.cleanupVirtualDisplay(entry);
-			// Only delete if this entry is still in the pool (avoid deleting a newer entry with same key)
-			const currentEntry = this.pool.get(normalized);
-			if (currentEntry === entry) {
-				this.pool.delete(normalized);
-				log('info', 'persistent context removed from pool', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
-			} else {
-				log('info', 'persistent context closed but newer entry exists', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
-			}
+		if (entry.closing) {
+			await entry.closing;
+			return;
 		}
+
+		entry.closing = (async () => {
+			try {
+				if (entry.launching) {
+					await entry.launching.catch(() => {});
+					entry.launching = undefined;
+				}
+				await entry.context?.close().catch(() => {});
+			} finally {
+				this.cleanupVirtualDisplay(entry);
+				// Only delete if this entry is still in the pool (avoid deleting a newer entry with same key)
+				const currentEntry = this.pool.get(normalized);
+				if (currentEntry === entry) {
+					this.pool.delete(normalized);
+					log('info', 'persistent context removed from pool', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
+				} else {
+					log('info', 'persistent context closed but newer entry exists', { userId: entry.userId, profileKey: normalized, profileDir: entry.profileDir });
+				}
+			}
+		})();
+		await entry.closing;
 	}
 
 	/**

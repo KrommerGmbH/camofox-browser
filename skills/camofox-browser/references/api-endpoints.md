@@ -259,6 +259,7 @@ Notes:
 - Restarts user context
 - Existing tabs become invalid
 - Can return `vncUrl` in non-headless modes
+- Windows x64 supports `headless: true` only; `false` and `"virtual"` return HTTP 400 before Linux-only Xvfb/VNC processes are attempted
 Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ## Download management

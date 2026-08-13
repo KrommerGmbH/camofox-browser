@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [2.4.7] - 2026-08-11
+
+### Added
+- Added official Windows x64 headless support and a reproducible portable ZIP build that bundles Node.js, the application runtime, the pinned Camoufox Windows x64 engine, portable runtime state under `data\home`, and third-party licensing notices.
+- Added Windows Node 20/22 CI plus a Windows x64 portable-artifact job that extracts into a path containing spaces and verifies bundled-runtime CLI startup, `/health`, a safe local create/navigate/snapshot/close browser flow, server shutdown, and portable-state placement.
+
+### Changed
+- Server subprocess launches now reuse `process.execPath`, so bundled/embedded Node runtimes do not depend on a globally installed `node` executable on `PATH`.
+- Package release verification is now implemented in cross-platform Node.js instead of Bash and runs on both Ubuntu and Windows CI.
+- The release workflow builds, verifies, and attaches the Windows x64 portable ZIP to tag releases.
+
+### Security
+- Refreshed the dependency lock for current advisories and override `adm-zip` to the patched `0.6.0` release without changing the supported Node floor or `camoufox-js` version.
+
+### Fixed
+- Windows now rejects headed and virtual/Xvfb/VNC display modes before Linux-only display processes can be attempted, while preserving existing Linux/macOS display behavior.
+- New Windows persistent profile directories now use deterministic hashed internal keys, preventing distinct case-sensitive user/session identities from aliasing on case-insensitive Windows filesystems while leaving Linux/macOS profile naming unchanged. Existing Windows directories from the previous layout remain readable in place when the exact legacy name is unambiguous; if both old and hashed directories exist, or Windows resolves a different case/trailing-dot/space-equivalent legacy name, profile launch fails closed and reports the paths to back up/reconcile instead of silently choosing or migrating state.
+
+### Tests
+- Added focused Windows platform and VNC side-effect regression tests plus a launcher test that removes Node from `PATH` and verifies the current runtime is reused.
+- Jest now isolates profiles, cookies, downloads, and traces under a disposable temp root and removes it after the run, preventing test/build verification from accumulating persistent state under the operator's `~/.camofox` directory.
+- Long-running session lifecycle coverage now reclaims its disposable profiles/downloads/cookies/traces after each fully closed case, preventing in-run profile buildup from exhausting Windows CI while retaining every lifecycle assertion.
+
 ## [2.4.6] - 2026-06-17
 
 ### Fixed
