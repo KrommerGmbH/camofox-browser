@@ -52,10 +52,11 @@ function makeContext() {
   return {
     pages: jest.fn(() => []),
     close: jest.fn(async () => {}),
+    on: jest.fn(),
   };
 }
 
-function makeSession(context, createdAt, tabId) {
+function makeSession(context, createdAt, tabId, generation = `generation:${createdAt}`) {
   return {
     context,
     tabGroups: new Map([[
@@ -73,10 +74,11 @@ function makeSession(context, createdAt, tabId) {
     ]]),
     lastAccess: createdAt,
     createdAt,
+    generation,
   };
 }
 
-function makePoolEntry(userId, profileKey, context, createdAt) {
+function makePoolEntry(userId, profileKey, context, createdAt, generation = `generation:${createdAt}`) {
   return {
     context,
     userId,
@@ -84,8 +86,27 @@ function makePoolEntry(userId, profileKey, context, createdAt) {
     profileDir: `/tmp/camofox-test/profiles/${profileKey}`,
     lastAccess: createdAt,
     createdAt,
+    generation,
     staged: false,
   };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+async function waitFor(predicate) {
+  for (let i = 0; i < 50; i++) {
+    if (predicate()) return;
+    await Promise.resolve();
+  }
+  throw new Error('condition not reached');
 }
 
 describe('ContextPool.closeContextBySession production boundary', () => {
@@ -136,6 +157,219 @@ describe('ContextPool.closeContextBySession production boundary', () => {
     expect(sessionModule.findTabById(replacementTabId, userId)).not.toBeNull();
     expect(originalContext.close).toHaveBeenCalledTimes(1);
     expect(replacementContext.close).not.toHaveBeenCalled();
+  });
+
+  test('preserves the real session when getSession rebinds it during close teardown', async () => {
+    const userId = 'rebind-owner';
+    const sessionKey = sessionModule.getSessionMapKey(userId, null);
+    const originalCreatedAt = 1000;
+    const originalTabId = 'rebind-original-tab';
+    const sessions = sessionModule.__getSessionsMapForTests();
+    const sessionOwners = sessionModule.__getSessionOwnersForTests();
+    const { firefox } = require('playwright-core');
+
+    const originalContext = makeContext();
+    const originalSession = makeSession(originalContext, originalCreatedAt, originalTabId);
+    const originalGeneration = originalSession.generation;
+    sessions.set(sessionKey, originalSession);
+    sessionOwners.set(sessionKey, userId);
+    sessionModule.indexTab(originalTabId, sessionKey);
+    contextPool.pool.set(
+      sessionKey,
+      makePoolEntry(userId, sessionKey, originalContext, originalCreatedAt),
+    );
+
+    const replacementContext = makeContext();
+    firefox.launchPersistentContext.mockResolvedValueOnce(replacementContext);
+
+    const closePromise = contextPool.closeContextBySession(userId, sessionKey);
+    const getPromise = sessionModule.getSession(userId);
+
+    const returnedSession = await getPromise;
+    await closePromise;
+
+    expect(returnedSession).toBe(originalSession);
+    expect(returnedSession.context).toBe(replacementContext);
+    expect(returnedSession.generation).not.toBe(originalGeneration);
+    expect(sessions.get(sessionKey)).toBe(originalSession);
+    expect(sessionOwners.get(sessionKey)).toBe(userId);
+    expect(contextPool.getEntry(sessionKey)?.context).toBe(replacementContext);
+  });
+
+  test('preserves a rebound real session when old and replacement timestamps collide', async () => {
+    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1000);
+    try {
+      const userId = 'rebind-equal-time-owner';
+      const sessionKey = sessionModule.getSessionMapKey(userId, null);
+      const originalTabId = 'rebind-equal-time-tab';
+      const sessions = sessionModule.__getSessionsMapForTests();
+      const sessionOwners = sessionModule.__getSessionOwnersForTests();
+      const { firefox } = require('playwright-core');
+
+      const originalContext = makeContext();
+      const originalSession = makeSession(originalContext, 1000, originalTabId);
+      const originalGeneration = originalSession.generation;
+      sessions.set(sessionKey, originalSession);
+      sessionOwners.set(sessionKey, userId);
+      sessionModule.indexTab(originalTabId, sessionKey);
+      contextPool.pool.set(
+        sessionKey,
+        makePoolEntry(userId, sessionKey, originalContext, 1000),
+      );
+
+      const replacementContext = makeContext();
+      firefox.launchPersistentContext.mockResolvedValueOnce(replacementContext);
+
+      const closePromise = contextPool.closeContextBySession(userId, sessionKey);
+      const getPromise = sessionModule.getSession(userId);
+
+      const returnedSession = await getPromise;
+      await closePromise;
+
+      expect(returnedSession).toBe(originalSession);
+      expect(returnedSession.createdAt).toBe(1000);
+      expect(returnedSession.context).toBe(replacementContext);
+      expect(returnedSession.generation).not.toBe(originalGeneration);
+      expect(sessions.get(sessionKey)).toBe(originalSession);
+      expect(sessionOwners.get(sessionKey)).toBe(userId);
+      expect(contextPool.getEntry(sessionKey)?.createdAt).toBe(1000);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  test('preserves replacement when getSession installs it before recovery snapshots equal timestamps', async () => {
+    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1000);
+    try {
+      const userId = 'reverse-order-owner';
+      const sessionKey = sessionModule.getSessionMapKey(userId, null);
+      const tabId = 'reverse-order-tab';
+      const sessions = sessionModule.__getSessionsMapForTests();
+      const sessionOwners = sessionModule.__getSessionOwnersForTests();
+      const { firefox } = require('playwright-core');
+      const launchGate = deferred();
+
+      const originalGeneration = 'context-generation-a';
+      const originalContext = makeContext();
+      originalContext.pages.mockImplementation(() => {
+        throw new Error('old context is closed');
+      });
+      const originalSession = makeSession(originalContext, 1000, tabId, originalGeneration);
+      sessions.set(sessionKey, originalSession);
+      sessionOwners.set(sessionKey, userId);
+      sessionModule.indexTab(tabId, sessionKey);
+      contextPool.pool.set(
+        sessionKey,
+        makePoolEntry(userId, sessionKey, originalContext, 1000, originalGeneration),
+      );
+
+      const replacementContext = makeContext();
+      firefox.launchPersistentContext.mockReturnValueOnce(launchGate.promise);
+
+      const getPromise = sessionModule.getSession(userId);
+      await waitFor(() => contextPool.getEntry(sessionKey)?.launching !== undefined);
+
+      const pendingEntry = contextPool.getEntry(sessionKey);
+      expect(pendingEntry).toBeDefined();
+      expect(pendingEntry.createdAt).toBe(1000);
+
+      const closePromise = contextPool.closeContextBySession(userId, sessionKey);
+      launchGate.resolve(replacementContext);
+
+      const returnedSession = await getPromise;
+      await closePromise;
+
+      expect(returnedSession).toBe(originalSession);
+      expect(returnedSession.context).toBe(replacementContext);
+      expect(replacementContext.close).not.toHaveBeenCalled();
+      expect(sessions.get(sessionKey)).toBe(originalSession);
+      expect(sessionOwners.get(sessionKey)).toBe(userId);
+      expect(sessionModule.findTabById(tabId, userId)).not.toBeNull();
+      expect(contextPool.getEntry(sessionKey)?.context).toBe(replacementContext);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  test('removes stale session when replacement launch fails during overlapping teardown', async () => {
+    const userId = 'failed-rebind-owner';
+    const sessionKey = sessionModule.getSessionMapKey(userId, null);
+    const tabId = 'failed-rebind-tab';
+    const sessions = sessionModule.__getSessionsMapForTests();
+    const sessionOwners = sessionModule.__getSessionOwnersForTests();
+    const { firefox } = require('playwright-core');
+    const closeGate = deferred();
+    const launchGate = deferred();
+
+    const originalGeneration = 'failed-context-generation-a';
+    const originalContext = makeContext();
+    originalContext.close.mockReturnValueOnce(closeGate.promise);
+    const originalSession = makeSession(originalContext, 1000, tabId, originalGeneration);
+    sessions.set(sessionKey, originalSession);
+    sessionOwners.set(sessionKey, userId);
+    sessionModule.indexTab(tabId, sessionKey);
+    contextPool.pool.set(
+      sessionKey,
+      makePoolEntry(userId, sessionKey, originalContext, 1000, originalGeneration),
+    );
+    firefox.launchPersistentContext.mockReturnValueOnce(launchGate.promise);
+
+    const closePromise = contextPool.closeContextBySession(userId, sessionKey);
+    const getPromise = sessionModule.getSession(userId);
+    expect(originalSession.generation).toBe(originalGeneration);
+    closeGate.resolve();
+    await waitFor(() => contextPool.getEntry(sessionKey)?.launching !== undefined);
+    expect(originalSession.generation).toBe(originalGeneration);
+    launchGate.reject(new Error('replacement launch failed'));
+
+    await expect(getPromise).rejects.toThrow('replacement launch failed');
+    await closePromise;
+
+    expect(sessions.has(sessionKey)).toBe(false);
+    expect(sessionOwners.has(sessionKey)).toBe(false);
+    expect(sessionModule.findTabById(tabId, userId)).toBeNull();
+    expect(contextPool.getEntry(sessionKey)).toBeUndefined();
+  });
+
+  test('concurrent getSession callers commit one replacement context identity', async () => {
+    const userId = 'concurrent-rebind-owner';
+    const sessionKey = sessionModule.getSessionMapKey(userId, null);
+    const tabId = 'concurrent-rebind-tab';
+    const sessions = sessionModule.__getSessionsMapForTests();
+    const sessionOwners = sessionModule.__getSessionOwnersForTests();
+    const { firefox } = require('playwright-core');
+    const launchGate = deferred();
+
+    const originalGeneration = 'concurrent-context-generation-a';
+    const originalContext = makeContext();
+    originalContext.pages.mockImplementation(() => {
+      throw new Error('old context is closed');
+    });
+    const originalSession = makeSession(originalContext, 1000, tabId, originalGeneration);
+    sessions.set(sessionKey, originalSession);
+    sessionOwners.set(sessionKey, userId);
+    sessionModule.indexTab(tabId, sessionKey);
+    contextPool.pool.set(
+      sessionKey,
+      makePoolEntry(userId, sessionKey, originalContext, 1000, originalGeneration),
+    );
+
+    const replacementContext = makeContext();
+    firefox.launchPersistentContext.mockReturnValueOnce(launchGate.promise);
+    const first = sessionModule.getSession(userId);
+    const second = sessionModule.getSession(userId);
+    await waitFor(() => contextPool.getEntry(sessionKey)?.launching !== undefined);
+    launchGate.resolve(replacementContext);
+
+    const [firstSession, secondSession] = await Promise.all([first, second]);
+    const entry = contextPool.getEntry(sessionKey);
+
+    expect(firstSession).toBe(originalSession);
+    expect(secondSession).toBe(originalSession);
+    expect(firstSession.context).toBe(replacementContext);
+    expect(firstSession.generation).toBe(entry.generation);
+    expect(firefox.launchPersistentContext).toHaveBeenCalledTimes(1);
+    expect(sessionModule.findTabById(tabId, userId)).not.toBeNull();
   });
 
   test('fails closed for a foreign owner when the pool entry is missing', async () => {

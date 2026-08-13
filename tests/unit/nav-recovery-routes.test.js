@@ -23,6 +23,7 @@
 // Track calls to closeContext / closeContextByUserId
 const mockCloseContext = jest.fn();
 const mockCloseContextByUserId = jest.fn();
+const mockEnsureContext = jest.fn();
 
 // Real pool Map to faithfully replicate closeContextBySession's pool-entry
 // check and generation tracking. This replaces the previous semantic
@@ -52,8 +53,8 @@ const mockCloseContextBySession = jest.fn(async (userId, profileKey) => {
       return;
     }
 
-    // Owner matches or entry is missing. Capture generation if entry exists.
-    const generation = entry ? entry.createdAt : undefined;
+    // Owner matches or entry is missing. Capture exact context generation if entry exists.
+    const generation = entry?.generation;
 
     // Capture durable session identity synchronously (HIGH round 8).
     const sessionModule = require('../../dist/src/services/session');
@@ -75,10 +76,10 @@ const mockCloseContextBySession = jest.fn(async (userId, profileKey) => {
 });
 
 // Generation-aware close: matches the real closeContextIfMatches logic.
-const mockCloseContextIfMatches = jest.fn(async (profileKey, expectedCreatedAt) => {
+const mockCloseContextIfMatches = jest.fn(async (profileKey, expectedGeneration) => {
   const entry = mockPool.get(profileKey);
   if (!entry) return;
-  if (entry.createdAt !== expectedCreatedAt) return;
+  if (entry.generation !== expectedGeneration) return;
   mockPool.delete(profileKey);
   mockCloseContext(profileKey);
 });
@@ -90,6 +91,8 @@ jest.mock('../../dist/src/services/context-pool', () => ({
     closeContextByUserId: mockCloseContextByUserId,
     closeContextIfMatches: mockCloseContextIfMatches,
     getPoolEntries: jest.fn(() => mockPool),
+    ensureContext: mockEnsureContext,
+    size: jest.fn(() => mockPool.size),
     onEvict: jest.fn(),
     evictIfNeeded: jest.fn(async () => {}),
     acquire: jest.fn(),
@@ -103,6 +106,14 @@ jest.mock('../../dist/src/services/context-pool', () => ({
 const mockNavigate = jest.fn();
 const mockValidateUrl = jest.fn(async () => null); // null = valid URL
 const mockBuildRefs = jest.fn(async () => new Map());
+const mockAcquirePageForNewTab = jest.fn();
+const mockCreateTabState = jest.fn(async (page) => ({
+  page,
+  visitedUrls: new Set(),
+  refs: new Map(),
+  toolCalls: 0,
+  downloads: [],
+}));
 
 jest.mock('../../dist/src/services/tab', () => ({
   navigateWithSafetyGuard: mockNavigate,
@@ -110,14 +121,8 @@ jest.mock('../../dist/src/services/tab', () => ({
   buildRefs: mockBuildRefs,
   withTimeout: jest.fn(async (promise) => promise), // pass-through
   withTabLock: jest.fn(async (_tabId, op) => op()), // pass-through
-  createTabState: jest.fn(async () => ({
-    page: { url: () => 'about:blank', close: jest.fn() },
-    visitedUrls: new Set(),
-    refs: new Map(),
-    toolCalls: 0,
-    downloads: [],
-  })),
-  acquirePageForNewTab: jest.fn(),
+  createTabState: mockCreateTabState,
+  acquirePageForNewTab: mockAcquirePageForNewTab,
   safePageClose: jest.fn(),
   buildSnapshotPayload: jest.fn(),
   calculateTypeTimeoutMs: jest.fn(() => 5000),
@@ -215,6 +220,7 @@ jest.mock('../../dist/src/utils/config', () => ({
     port: 9377,
     headless: true,
     vncResolution: '1920x1080x24',
+    proxy: { host: '', port: '', username: '', password: '' },
     ytDlpTimeoutMs: 30000,
     ytBrowserTimeoutMs: 25000,
     evalExtendedRateLimitMax: 10,
@@ -225,6 +231,7 @@ jest.mock('../../dist/src/utils/config', () => ({
 
 // Mock presets
 jest.mock('../../dist/src/utils/presets', () => ({
+  contextHash: jest.fn(() => 'test-context-hash'),
   getAllPresets: jest.fn(() => ({})),
   resolveContextOptions: jest.fn(() => ({})),
   validateContextOptions: jest.fn(() => null),
@@ -254,6 +261,21 @@ const { handleNavFailure } = require('../../dist/src/services/nav-recovery');
 const sessionModule = require('../../dist/src/services/session');
 
 // ── Test helpers ────────────────────────────────────────────────────
+
+let testSessionGeneration = 0;
+
+function nextTestSessionGeneration() {
+  testSessionGeneration += 1;
+  return `test-session-generation-${testSessionGeneration}`;
+}
+
+function makeRoutePage() {
+  return {
+    url: jest.fn(() => 'about:blank'),
+    title: jest.fn(async () => ''),
+    close: jest.fn(async () => {}),
+  };
+}
 
 /**
  * Mount the real core + openclaw route handlers on a test Express app.
@@ -304,6 +326,7 @@ function setupFakeTab(userId, tabId, sessionKeyOverride) {
     tabGroups: new Map([[sessionKey, new Map([[tabId, tabState]])]]),
     lastAccess: Date.now(),
     createdAt: Date.now(),
+    generation: nextTestSessionGeneration(),
   };
 
   sessions.set(sessionKey, session);
@@ -341,6 +364,7 @@ function setupSiblingSessions(userId, tabIdA, sessionKeyA, tabIdB, sessionKeyB) 
     tabGroups: new Map([[sessionKeyA, new Map([[tabIdA, mkTab(tabIdA)]])]]),
     lastAccess: Date.now(),
     createdAt: Date.now(),
+    generation: nextTestSessionGeneration(),
   };
   sessions.set(sessionKeyA, sessionA);
   sessionOwners.set(sessionKeyA, String(userId));
@@ -352,12 +376,41 @@ function setupSiblingSessions(userId, tabIdA, sessionKeyA, tabIdB, sessionKeyB) 
     tabGroups: new Map([[sessionKeyB, new Map([[tabIdB, mkTab(tabIdB)]])]]),
     lastAccess: Date.now(),
     createdAt: Date.now(),
+    generation: nextTestSessionGeneration(),
   };
   sessions.set(sessionKeyB, sessionB);
   sessionOwners.set(sessionKeyB, String(userId));
   sessionModule.indexTab(tabIdB, sessionKeyB);
 
   return { sessionA, sessionB };
+}
+
+function setupOpenClawSession(userId) {
+  sessionModule.commitCanonicalProfile(userId, null);
+  const sessionKey = sessionModule.getSessionMapKey(userId, null);
+  const context = { close: jest.fn().mockResolvedValue(undefined) };
+  const session = {
+    context,
+    tabGroups: new Map(),
+    lastAccess: Date.now(),
+    createdAt: Date.now(),
+    generation: nextTestSessionGeneration(),
+  };
+  const entry = {
+    userId: String(userId),
+    profileKey: sessionKey,
+    context,
+    createdAt: Date.now(),
+    generation: session.generation,
+    lastAccess: Date.now(),
+    staged: false,
+  };
+
+  sessionModule.__getSessionsMapForTests().set(sessionKey, session);
+  sessionModule.__getSessionOwnersForTests().set(sessionKey, String(userId));
+  mockPool.set(sessionKey, entry);
+
+  return { sessionKey, session, entry };
 }
 
 function cleanupSessions() {
@@ -392,6 +445,8 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
     mockBuildRefs.mockResolvedValue(new Map());
     mockCloseContext.mockResolvedValue(undefined);
     mockCloseContextByUserId.mockResolvedValue(undefined);
+    mockEnsureContext.mockImplementation(async (profileKey) => mockPool.get(profileKey));
+    mockAcquirePageForNewTab.mockImplementation(async () => makeRoutePage());
   });
 
   afterEach(() => {
@@ -810,6 +865,7 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
         }]])]]),
         lastAccess: Date.now(),
         createdAt: Date.now(),
+        generation: nextTestSessionGeneration(),
       };
       sessions.set(sessionKey, session);
       sessionOwners.set(sessionKey, String(userId));
@@ -842,6 +898,8 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
     test('teardownSessionByKey with old generation does not close newer entry', async () => {
       const sessionKey = 'session-key-gen-test';
       const userId = 'test-user-gen';
+      const oldGeneration = nextTestSessionGeneration();
+      const newGeneration = nextTestSessionGeneration();
 
       // Set up a session
       const sessions = sessionModule.__getSessionsMapForTests();
@@ -851,25 +909,26 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
         tabGroups: new Map([[sessionKey, new Map()]]),
         lastAccess: Date.now(),
         createdAt: Date.now(),
+        generation: oldGeneration,
       });
       sessionOwners.set(sessionKey, userId);
 
-      // Set up a NEW pool entry with createdAt=2000
+      // Set up a NEW pool entry with a different immutable generation.
       const newCreatedAt = 2000;
-      mockPool.set(sessionKey, { userId, createdAt: newCreatedAt, staged: false });
+      mockPool.set(sessionKey, { userId, createdAt: newCreatedAt, generation: newGeneration, staged: false });
       mockCloseContext.mockClear();
       mockCloseContextIfMatches.mockClear();
 
-      // Call teardown with the OLD generation (1000) — this simulates
+      // Call teardown with the OLD context generation — this simulates
       // the race where the pool entry was replaced during the await.
-      await sessionModule.teardownSessionByKey(sessionKey, 1000);
+      await sessionModule.teardownSessionByKey(sessionKey, oldGeneration);
 
       // The session/tab records are cleaned up regardless (teardown always runs)
       expect(sessions.has(sessionKey)).toBe(false);
 
       // The NEW pool entry should NOT have been closed (generation mismatch)
       // closeContextIfMatches should have been called but should NOT have deleted the entry
-      expect(mockCloseContextIfMatches).toHaveBeenCalledWith(sessionKey, 1000);
+      expect(mockCloseContextIfMatches).toHaveBeenCalledWith(sessionKey, oldGeneration);
       expect(mockCloseContext).not.toHaveBeenCalled();
 
       // Pool entry survives
@@ -881,6 +940,7 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
     test('teardownSessionByKey with matching generation closes the entry', async () => {
       const sessionKey = 'session-key-gen-match';
       const userId = 'test-user-gen-match';
+      const generation = nextTestSessionGeneration();
 
       const sessions = sessionModule.__getSessionsMapForTests();
       const sessionOwners = sessionModule.__getSessionOwnersForTests();
@@ -889,18 +949,19 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
         tabGroups: new Map([[sessionKey, new Map()]]),
         lastAccess: Date.now(),
         createdAt: Date.now(),
+        generation,
       });
       sessionOwners.set(sessionKey, userId);
 
       const createdAt = 5000;
-      mockPool.set(sessionKey, { userId, createdAt, staged: false });
+      mockPool.set(sessionKey, { userId, createdAt, generation, staged: false });
       mockCloseContext.mockClear();
       mockCloseContextIfMatches.mockClear();
 
-      await sessionModule.teardownSessionByKey(sessionKey, createdAt);
+      await sessionModule.teardownSessionByKey(sessionKey, generation);
 
       // The entry should be closed and removed from the pool
-      expect(mockCloseContextIfMatches).toHaveBeenCalledWith(sessionKey, createdAt);
+      expect(mockCloseContextIfMatches).toHaveBeenCalledWith(sessionKey, generation);
       expect(mockCloseContext).toHaveBeenCalledWith(sessionKey);
       expect(mockPool.get(sessionKey)).toBeUndefined();
       expect(sessions.has(sessionKey)).toBe(false);
@@ -973,11 +1034,12 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
         tabGroups: new Map([[sessionKey, new Map()]]),
         lastAccess: Date.now(),
         createdAt: Date.now(),
+        generation: nextTestSessionGeneration(),
       });
       sessionOwners.set(sessionKey, victimUser);
 
       // Pool entry exists, owned by victim-user
-      mockPool.set(sessionKey, { userId: victimUser, createdAt: 1000, staged: false });
+      mockPool.set(sessionKey, { userId: victimUser, createdAt: 1000, generation: nextTestSessionGeneration(), staged: false });
       mockCloseContext.mockClear();
       mockCloseContextIfMatches.mockClear();
 
@@ -1011,6 +1073,7 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
         tabGroups: new Map([[sessionKey, new Map()]]),
         lastAccess: Date.now(),
         createdAt: Date.now(),
+        generation: nextTestSessionGeneration(),
       });
       sessionOwners.set(sessionKey, userId);
 
@@ -1041,6 +1104,7 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
         tabGroups: new Map([[sessionKey, new Map()]]),
         lastAccess: Date.now(),
         createdAt: oldCreatedAt,
+        generation: nextTestSessionGeneration(),
       });
       sessionOwners.set(sessionKey, userId);
 
@@ -1073,26 +1137,29 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
       const sessions = sessionModule.__getSessionsMapForTests();
       const sessionOwners = sessionModule.__getSessionOwnersForTests();
 
-      // Old session with createdAt = 1000
+      // Old session with temporal metadata createdAt = 1000.
       const oldCreatedAt = 1000;
+      const oldGeneration = nextTestSessionGeneration();
       sessions.set(sessionKey, {
         context: { close: jest.fn().mockResolvedValue(undefined) },
         tabGroups: new Map([[sessionKey, new Map()]]),
         lastAccess: Date.now(),
         createdAt: oldCreatedAt,
+        generation: oldGeneration,
       });
       sessionOwners.set(sessionKey, userId);
 
       // Pool entry with matching generation
-      mockPool.set(sessionKey, { userId, createdAt: oldCreatedAt, staged: false });
+      mockPool.set(sessionKey, { userId, createdAt: oldCreatedAt, generation: oldGeneration, staged: false });
 
       // Make closeContextIfMatches replace the session during the close await.
-      // This simulates a new session appearing with the same key but a
-      // different createdAt.
+      // This simulates a new session appearing with the same key and a
+      // distinct opaque session generation.
       const newCreatedAt = 2000;
-      mockCloseContextIfMatches.mockImplementation(async (key, expectedCreatedAt) => {
+      const newGeneration = nextTestSessionGeneration();
+      mockCloseContextIfMatches.mockImplementation(async (key, expectedGeneration) => {
         const entry = mockPool.get(key);
-        if (!entry || entry.createdAt !== expectedCreatedAt) return;
+        if (!entry || entry.generation !== expectedGeneration) return;
         mockPool.delete(key);
         mockCloseContext(key);
         // Simulate replacement: a new session appears with the same key
@@ -1101,16 +1168,18 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
           tabGroups: new Map([[key, new Map()]]),
           lastAccess: Date.now(),
           createdAt: newCreatedAt,
+          generation: newGeneration,
         });
         sessionOwners.set(key, userId);
       });
 
-      await sessionModule.teardownSessionByKey(sessionKey, oldCreatedAt);
+      await sessionModule.teardownSessionByKey(sessionKey, oldGeneration);
 
       // The NEW session should still exist — teardown should NOT have deleted it
       const currentSession = sessions.get(sessionKey);
       expect(currentSession).toBeDefined();
       expect(currentSession.createdAt).toBe(newCreatedAt);
+      expect(currentSession.generation).toBe(newGeneration);
     });
   });
 
@@ -1128,6 +1197,7 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
         tabGroups: new Map([[sessionKey, new Map()]]),
         lastAccess: Date.now(),
         createdAt: Date.now(),
+        generation: nextTestSessionGeneration(),
       });
       sessionOwners.set(sessionKey, userId);
 
@@ -1160,6 +1230,7 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
         tabGroups: new Map([[sessionKey, new Map()]]),
         lastAccess: Date.now(),
         createdAt: Date.now(),
+        generation: nextTestSessionGeneration(),
       });
       sessionOwners.set(sessionKey, userId);
 
@@ -1201,6 +1272,8 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
 
       const originalCreatedAt = 1000;
       const replacementCreatedAt = 2000;
+      const originalGeneration = nextTestSessionGeneration();
+      const replacementGeneration = nextTestSessionGeneration();
 
       sessions.set(sessionKey, {
         context: { close: jest.fn().mockResolvedValue(undefined) },
@@ -1210,15 +1283,16 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
         }]])]]),
         lastAccess: Date.now(),
         createdAt: originalCreatedAt,
+        generation: originalGeneration,
       });
       sessionOwners.set(sessionKey, userId);
       sessionModule.indexTab('tab-r8', sessionKey);
 
-      mockPool.set(sessionKey, { userId, createdAt: originalCreatedAt, staged: false });
+      mockPool.set(sessionKey, { userId, createdAt: originalCreatedAt, generation: originalGeneration, staged: false });
 
       const snapshot = sessionModule.getSessionSnapshot(sessionKey);
       expect(snapshot.owner).toBe(userId);
-      expect(snapshot.createdAt).toBe(originalCreatedAt);
+      expect(snapshot.generation).toBe(originalGeneration);
 
       mockCloseContextIfMatches.mockImplementationOnce(async () => {
         sessions.set(sessionKey, {
@@ -1226,15 +1300,17 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
           tabGroups: new Map([[sessionKey, new Map()]]),
           lastAccess: Date.now(),
           createdAt: replacementCreatedAt,
+          generation: replacementGeneration,
         });
       });
 
-      const result = await sessionModule.teardownSessionByKey(sessionKey, originalCreatedAt, snapshot);
+      const result = await sessionModule.teardownSessionByKey(sessionKey, originalGeneration, snapshot);
 
       expect(result).toBe(true);
       const currentSession = sessions.get(sessionKey);
       expect(currentSession).toBeDefined();
       expect(currentSession.createdAt).toBe(replacementCreatedAt);
+      expect(currentSession.generation).toBe(replacementGeneration);
       expect(sessionModule.findTabById('tab-r8', userId)).toBeNull();
       expect(sessionOwners.get(sessionKey)).toBe(userId);
     });
@@ -1257,6 +1333,7 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
         }]])]]),
         lastAccess: Date.now(),
         createdAt: 1000,
+        generation: nextTestSessionGeneration(),
       });
       sessionOwners.set(sessionKey, victimUser);
       sessionModule.indexTab('tab-victim-r8', sessionKey);
@@ -1286,6 +1363,7 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
         }]])]]),
         lastAccess: Date.now(),
         createdAt: 1000,
+        generation: nextTestSessionGeneration(),
       });
       sessionOwners.set(sessionKey, userId);
       sessionModule.indexTab('tab-owner-r8', sessionKey);
@@ -1339,29 +1417,78 @@ describe('Nav recovery — route-level tests (round 5 blockers)', () => {
       expect(__getUserHealthForTests('user-r9b', 'session-r9b')).toBeUndefined();
     });
 
-    test('openclaw /tabs/open navigation failure counts toward threshold', async () => {
-      __clearUserHealthForTests();
+    test('POST /tabs/open triggers recovery after three navigation failures', async () => {
+      const userId = 'user-open-r9';
+      const { sessionKey } = setupOpenClawSession(userId);
+      mockNavigate.mockRejectedValue(new Error('navigation failed'));
 
-      // Simulate 3 nav failures via handleNavFailure (same as /tabs/open catch would call)
       for (let i = 0; i < 3; i++) {
-        await handleNavFailure('user-open-r9', 'session-open-r9');
+        const response = await supertest(app)
+          .post('/tabs/open')
+          .send({ userId, url: 'https://example.com' })
+          .expect(500);
+        expect(response.body.error).toContain('navigation failed');
       }
-      // After 3 failures, recovery should have fired — lock acquired, then
-      // released in finally, entry deleted in finally. Entry is gone.
-      expect(__getUserHealthForTests('user-open-r9', 'session-open-r9')).toBeUndefined();
+
+      expect(mockNavigate).toHaveBeenCalledTimes(3);
+      expect(mockCloseContextBySession).toHaveBeenCalledTimes(1);
+      expect(mockCloseContextBySession).toHaveBeenCalledWith(userId, sessionKey);
+      expect(__getUserHealthForTests(userId, sessionKey)).toBeUndefined();
     });
 
-    test('openclaw /tabs/open provisioning failure does not count toward threshold', async () => {
-      __clearUserHealthForTests();
-      // A provisioning failure (e.g. acquirePageForNewTab) would have navError=false
-      // so handleNavFailure is NOT called. Simulate by only calling recordNavFailure
-      // 2 times (below threshold) — no recovery.
-      recordNavFailure('user-open-prov', 'session-open-prov');
-      recordNavFailure('user-open-prov', 'session-open-prov');
-      const h = __getUserHealthForTests('user-open-prov', 'session-open-prov');
-      expect(h).toBeDefined();
-      expect(h.consecutiveNavFailures).toBe(2);
-      expect(h.recovering).toBe(false);
+    test('POST /tabs/open success resets prior navigation failures', async () => {
+      const userId = 'user-open-success-r9';
+      const { sessionKey } = setupOpenClawSession(userId);
+      mockNavigate
+        .mockRejectedValueOnce(new Error('navigation failed 1'))
+        .mockRejectedValueOnce(new Error('navigation failed 2'))
+        .mockResolvedValueOnce(undefined);
+
+      const firstFailure = await supertest(app).post('/tabs/open').send({ userId, url: 'https://example.com/a' }).expect(500);
+      const secondFailure = await supertest(app).post('/tabs/open').send({ userId, url: 'https://example.com/b' }).expect(500);
+      expect(firstFailure.body.error).toContain('navigation failed 1');
+      expect(secondFailure.body.error).toContain('navigation failed 2');
+      expect(mockNavigate).toHaveBeenCalledTimes(2);
+      expect(__getUserHealthForTests(userId, sessionKey)?.consecutiveNavFailures).toBe(2);
+
+      await supertest(app).post('/tabs/open').send({ userId, url: 'https://example.com/c' }).expect(200);
+
+      expect(__getUserHealthForTests(userId, sessionKey)?.consecutiveNavFailures ?? 0).toBe(0);
+      expect(mockCloseContextBySession).not.toHaveBeenCalled();
+    });
+
+    test('POST /tabs/open provisioning failure does not count as navigation failure', async () => {
+      const userId = 'user-open-prov-r9';
+      const { sessionKey } = setupOpenClawSession(userId);
+      mockAcquirePageForNewTab.mockRejectedValue(new Error('page provisioning failed'));
+
+      for (let i = 0; i < 3; i++) {
+        await supertest(app)
+          .post('/tabs/open')
+          .send({ userId, url: 'https://example.com' })
+          .expect(500);
+      }
+
+      expect(__getUserHealthForTests(userId, sessionKey)?.consecutiveNavFailures ?? 0).toBe(0);
+      expect(mockCloseContextBySession).not.toHaveBeenCalled();
+      expect(mockNavigate).not.toHaveBeenCalled();
+    });
+
+    test('POST /tabs/open validation failure does not count as navigation failure', async () => {
+      const userId = 'user-open-validation-r9';
+      const { sessionKey } = setupOpenClawSession(userId);
+      mockValidateUrl.mockResolvedValue('blocked URL');
+
+      for (let i = 0; i < 3; i++) {
+        await supertest(app)
+          .post('/tabs/open')
+          .send({ userId, url: 'https://example.com' })
+          .expect(400);
+      }
+
+      expect(__getUserHealthForTests(userId, sessionKey)?.consecutiveNavFailures ?? 0).toBe(0);
+      expect(mockCloseContextBySession).not.toHaveBeenCalled();
+      expect(mockAcquirePageForNewTab).not.toHaveBeenCalled();
     });
   });
 });

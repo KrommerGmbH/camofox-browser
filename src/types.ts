@@ -66,7 +66,8 @@ export interface SessionData {
   context: BrowserContext;
   tabGroups: Map<string, Map<string, TabState>>;
   lastAccess: number;
-  createdAt: number;  // Timestamp when this session was created (generation identity)
+  createdAt: number;  // Timestamp when this session was created (temporal metadata only)
+  generation: string; // Exact immutable generation of the currently committed backing context
 }
 
 export interface WaitForPageReadyOptions {

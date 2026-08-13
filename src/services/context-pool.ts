@@ -1,5 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { type ChildProcess, spawn } from 'node:child_process';
 import { type Readable } from 'node:stream';
 
@@ -32,7 +33,8 @@ export interface PoolEntry {
 	profileKey: string;
 	profileDir: string;
 	lastAccess: number;
-	createdAt: number;  // Timestamp when this entry was created
+	createdAt: number;  // Timestamp when this entry was created (temporal metadata only)
+	generation: string; // Immutable opaque identity for this exact context entry
 	launching?: Promise<BrowserContext>;
 	closing?: Promise<void>;
 	staged?: boolean;
@@ -623,6 +625,7 @@ export class ContextPool {
 			profileDir,
 			lastAccess: Date.now(),
 			createdAt: Date.now(),
+			generation: crypto.randomUUID(),
 			staged,
 			stagedGeneration,
 			proxyConfig: resolvedProxy || null,
@@ -707,7 +710,7 @@ export class ContextPool {
 		if (profileKey !== undefined && profileKey !== null && profileKey !== '') {
 			const normalizedProfile = String(profileKey);
 
-			// Capture the current pool entry's generation timestamp before
+			// Capture the current pool entry's immutable generation before
 			// any await. This prevents the replacement race: if a new entry
 			// with the same key appears during teardown, the generation check
 			// below will NOT close the newer
@@ -734,25 +737,25 @@ export class ContextPool {
 				return;
 			}
 
-			// If the pool entry exists and the owner matches, capture the
-			// generation timestamp for safe teardown.
+			// If the pool entry exists and the owner matches, capture its
+			// immutable opaque generation for safe teardown.
 			// If the pool entry is missing, generation is undefined — meaning
 			// "clean stale session/tab index records only; do NOT close any
 			// context, because a new context may have appeared during the
 			// await and must not be destroyed" (HIGH B).
-			const generation = entry ? entry.createdAt : undefined;
+			const generation = entry?.generation;
 
 			// Resolve session.ts lazily to avoid the top-level circular dependency,
 			// but do it synchronously so the durable session snapshot is captured
 			// before this method's first await.
 			const { getSessionSnapshot, teardownSessionByKey } = require('./session') as typeof import('./session');
 
-			// Capture the durable session identity (owner + generation)
+			// Capture the durable session identity (owner + session generation)
 			// synchronously, before teardownSessionByKey's internal await
 			// (HIGH round 8). This prevents the replacement race where a new
 			// session with the same key appears during the context-close await
-			// inside teardownSessionByKey. The snapshot's createdAt is the
-			// authoritative session generation; the snapshot's owner is
+			// inside teardownSessionByKey. The snapshot's opaque generation is
+			// authoritative for session identity; the snapshot's owner is
 			// validated against the requesting user for the pool-missing path.
 			const sessionSnapshot = getSessionSnapshot(normalizedProfile);
 
@@ -806,11 +809,11 @@ export class ContextPool {
 		}
 	}
 
-	async closeContextIfMatches(profileKey: string, expectedCreatedAt: number, expectedLastAccess?: number): Promise<void> {
+	async closeContextIfMatches(profileKey: string, expectedGeneration: string, expectedLastAccess?: number): Promise<void> {
 		const normalized = String(profileKey);
 		const entry = this.pool.get(normalized);
 		if (!entry) return;
-		if (entry.createdAt !== expectedCreatedAt) return;
+		if (entry.generation !== expectedGeneration) return;
 		// If lastAccess was provided and has changed, the context was reused - don't close
 		if (expectedLastAccess !== undefined && entry.lastAccess !== expectedLastAccess) return;
 		await this.closeContext(normalized);
