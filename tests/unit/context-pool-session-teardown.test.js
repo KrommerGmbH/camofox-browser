@@ -42,11 +42,12 @@ jest.mock('../../dist/src/services/health', () => ({
   incrementActiveOps: jest.fn(),
   deleteUserHealth: jest.fn(),
 }));
-jest.mock('../../dist/src/services/vnc', () => ({ stopVnc: jest.fn() }));
+jest.mock('../../dist/src/services/vnc', () => ({ stopVnc: jest.fn(async () => {}) }));
 jest.mock('../../dist/src/services/tracing', () => ({ cleanupTracing: jest.fn() }));
 
 const sessionModule = require('../../dist/src/services/session');
 const { contextPool } = require('../../dist/src/services/context-pool');
+const { firefox } = require('playwright-core');
 
 function makeContext() {
   return {
@@ -117,6 +118,7 @@ describe('ContextPool.closeContextBySession production boundary', () => {
   });
 
   afterEach(() => {
+    sessionModule.stopCleanupInterval();
     sessionModule.clearAllState();
     contextPool.pool.clear();
   });
@@ -370,6 +372,112 @@ describe('ContextPool.closeContextBySession production boundary', () => {
     expect(firstSession.generation).toBe(entry.generation);
     expect(firefox.launchPersistentContext).toHaveBeenCalledTimes(1);
     expect(sessionModule.findTabById(tabId, userId)).not.toBeNull();
+  });
+
+  test.each([
+    ['explicit close', (userId) => sessionModule.closeSessionsForUser(userId)],
+    ['bulk close', () => sessionModule.closeAllSessions()],
+  ])('%s tombstones a pending rebind before closing its replacement', async (_label, closeSessions) => {
+    const userId = `pending-close-${_label.replace(/\s/g, '-')}`;
+    const sessionKey = sessionModule.getSessionMapKey(userId, null);
+    const tabId = `${userId}-tab`;
+    const sessions = sessionModule.__getSessionsMapForTests();
+    const sessionOwners = sessionModule.__getSessionOwnersForTests();
+    const launchGate = deferred();
+    const originalContext = makeContext();
+    originalContext.pages.mockImplementation(() => {
+      throw new Error('old context is closed');
+    });
+    const originalSession = makeSession(originalContext, 1000, tabId, 'pending-close-old');
+    sessions.set(sessionKey, originalSession);
+    sessionOwners.set(sessionKey, userId);
+    sessionModule.indexTab(tabId, sessionKey);
+    contextPool.pool.set(sessionKey, makePoolEntry(userId, sessionKey, originalContext, 1000, 'pending-close-old'));
+
+    const replacementContext = makeContext();
+    firefox.launchPersistentContext.mockReturnValueOnce(launchGate.promise);
+    const getPromise = sessionModule.getSession(userId);
+    await waitFor(() => contextPool.getEntry(sessionKey)?.launching !== undefined);
+
+    const closePromise = closeSessions(userId);
+    launchGate.resolve(replacementContext);
+
+    await expect(getPromise).rejects.toThrow(/closed|superseded/i);
+    await closePromise;
+    expect(replacementContext.close).toHaveBeenCalledTimes(1);
+    expect(sessions.has(sessionKey)).toBe(false);
+    expect(sessionOwners.has(sessionKey)).toBe(false);
+    expect(sessionModule.findTabById(tabId, userId)).toBeNull();
+    expect(contextPool.getEntry(sessionKey)).toBeUndefined();
+  });
+
+  test('timeout cleanup skips a session while its replacement rebind is pending', async () => {
+    jest.useFakeTimers();
+    try {
+      const userId = 'pending-timeout-owner';
+      const sessionKey = sessionModule.getSessionMapKey(userId, null);
+      const tabId = 'pending-timeout-tab';
+      const sessions = sessionModule.__getSessionsMapForTests();
+      const sessionOwners = sessionModule.__getSessionOwnersForTests();
+      const launchGate = deferred();
+      const originalContext = makeContext();
+      originalContext.pages.mockImplementation(() => {
+        throw new Error('old context is closed');
+      });
+      const originalSession = makeSession(originalContext, 0, tabId, 'pending-timeout-old');
+      sessions.set(sessionKey, originalSession);
+      sessionOwners.set(sessionKey, userId);
+      sessionModule.indexTab(tabId, sessionKey);
+      contextPool.pool.set(sessionKey, makePoolEntry(userId, sessionKey, originalContext, 0, 'pending-timeout-old'));
+
+      const replacementContext = makeContext();
+      firefox.launchPersistentContext.mockReturnValueOnce(launchGate.promise);
+      const getPromise = sessionModule.getSession(userId);
+      await waitFor(() => contextPool.getEntry(sessionKey)?.launching !== undefined);
+
+      sessionModule.startCleanupInterval();
+      jest.advanceTimersByTime(60_000);
+      expect(sessions.get(sessionKey)).toBe(originalSession);
+
+      launchGate.resolve(replacementContext);
+      const rebound = await getPromise;
+      expect(rebound).toBe(originalSession);
+      expect(rebound.context).toBe(replacementContext);
+      expect(sessions.get(sessionKey)).toBe(originalSession);
+      expect(sessionModule.findTabById(tabId, userId)).not.toBeNull();
+    } finally {
+      sessionModule.stopCleanupInterval();
+      jest.useRealTimers();
+    }
+  });
+
+  test('stale context close callback cannot remove a newer same-key pool entry', async () => {
+    const userId = 'stale-listener-owner';
+    const sessionKey = 'stale-listener-session';
+    let oldCloseListener;
+    let oldIsDead = false;
+    const oldContext = makeContext();
+    oldContext.pages.mockImplementation(() => {
+      if (oldIsDead) throw new Error('old context died');
+      return [];
+    });
+    oldContext.on.mockImplementation((event, listener) => {
+      if (event === 'close') oldCloseListener = listener;
+    });
+    const replacementContext = makeContext();
+    firefox.launchPersistentContext
+      .mockResolvedValueOnce(oldContext)
+      .mockResolvedValueOnce(replacementContext);
+
+    const oldEntry = await contextPool.ensureContext(sessionKey, userId);
+    oldIsDead = true;
+    const replacementEntry = await contextPool.ensureContext(sessionKey, userId);
+    expect(replacementEntry.generation).not.toBe(oldEntry.generation);
+    expect(contextPool.getEntry(sessionKey)).toBe(replacementEntry);
+
+    oldCloseListener();
+    expect(contextPool.getEntry(sessionKey)).toBe(replacementEntry);
+    expect(replacementEntry.context).toBe(replacementContext);
   });
 
   test('fails closed for a foreign owner when the pool entry is missing', async () => {

@@ -641,13 +641,17 @@ export class ContextPool {
 				context.on('close', () => {
 					this.cleanupVirtualDisplay(newEntry);
 					log('info', 'persistent context closed', { userId: normalized, profileKey, profileDir });
-					this.pool.delete(profileKey);
+					if (this.pool.get(profileKey) === newEntry) {
+						this.pool.delete(profileKey);
+					}
 				});
 				return context;
 			})
 			.catch((err) => {
 				this.cleanupVirtualDisplay(newEntry);
-				this.pool.delete(profileKey);
+				if (this.pool.get(profileKey) === newEntry) {
+					this.pool.delete(profileKey);
+				}
 				const message = err instanceof Error ? err.message : String(err);
 				log('error', 'persistent context launch failed', { userId: normalized, profileKey, profileDir, error: message });
 				throw err;

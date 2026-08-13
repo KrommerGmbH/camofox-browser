@@ -132,6 +132,18 @@ function cancelSessionRebindReservation(sessionMapKey: string, error: unknown): 
 	reservation.resolve({ ok: false, error });
 }
 
+function cancelSessionRebindReservationsForCleanupKey(
+	cleanupKey: string,
+	allowInternalSessionKey: boolean,
+	error: Error,
+): void {
+	for (const sessionKey of Array.from(sessionRebindReservations.keys())) {
+		if (isSessionMapKeyForCleanupKey(sessionKey, cleanupKey, allowInternalSessionKey)) {
+			cancelSessionRebindReservation(sessionKey, error);
+		}
+	}
+}
+
 function contextNeedsRebind(session: SessionData, entry: PoolEntry | undefined): boolean {
 	if (!entry || entry.closing !== undefined || entry.generation !== session.generation || entry.context !== session.context) {
 		return true;
@@ -1227,15 +1239,18 @@ export interface CloseSessionsForUserOptions {
 
 export async function closeSessionsForUser(userId: string, options: CloseSessionsForUserOptions = {}): Promise<void> {
 	const key = normalizeUserId(userId);
+	cancelSessionRebindReservationsForCleanupKey(key, false, new Error('Session explicitly closed'));
 	await contextPool.closeStagedContextByUserId(key).catch(() => {});
 	await contextPool.closeContextByUserId(key).catch(() => {});
 	cleanupSessionsForUserId(key, 'explicit_close', options.clearProfiles ?? true, { allowInternalSessionKey: false });
 }
 
 export async function closeAllSessions(): Promise<void> {
+	for (const sessionKey of Array.from(sessionRebindReservations.keys())) {
+		cancelSessionRebindReservation(sessionKey, new Error('All sessions closed'));
+	}
 	await contextPool.closeAll().catch(() => {});
 	for (const [sessionKey, session] of sessions) {
-		cancelSessionRebindReservation(sessionKey, new Error('All sessions closed'));
 		const ownerUserId = sessionOwners.get(sessionKey) ?? sessionKey;
 		void stopVnc(ownerUserId).catch(() => {});
 		unindexSessionTabs(session);
@@ -1270,6 +1285,7 @@ export function startCleanupInterval(): NodeJS.Timeout {
 		const now = Date.now();
 		for (const [sessionKey, session] of sessions) {
 			if (now - session.lastAccess > SESSION_TIMEOUT_MS) {
+				if (sessionRebindReservations.has(sessionKey)) continue;
 				const ownerUserId = sessionOwners.get(sessionKey) ?? sessionKey;
 				// Persistent profile is preserved on disk; closing the context frees resources.
 				contextPool.closeContext(sessionKey).catch(() => {});
