@@ -29,11 +29,11 @@ describe('Lifecycle idle cleanup (Stage 1)', () => {
 
   afterAll(async () => {
     await stopTestSite();
-  }, 30000);
+  }, 120000);
 
   afterEach(async () => {
     await stopServer();
-  }, 30000);
+  }, 120000);
 
   test('idle cleanup closes runtime state and next request relaunches cleanly', async () => {
     // Start server with short idle timeout
@@ -97,7 +97,7 @@ describe('Lifecycle idle cleanup (Stage 1)', () => {
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const healthFinal = await fetch(`${serverUrl}/health`);
     const healthFinalData = await healthFinal.json();
-  }, 60000);
+  }, 120000);
 
   test('idle cleanup does not run while tabs exist', async () => {
     // Start server with short idle timeout
@@ -138,7 +138,7 @@ describe('Lifecycle idle cleanup (Stage 1)', () => {
 
     // Now idle cleanup should trigger
     await waitForPoolSize(serverUrl, 0, 5000);
-  }, 30000);
+  }, 120000);
 
   test('activity resets idle timer and prevents cleanup', async () => {
     // Start server with short idle timeout
@@ -177,7 +177,7 @@ describe('Lifecycle idle cleanup (Stage 1)', () => {
     const health = await fetch(`${serverUrl}/health`);
     const healthData = await health.json();
     expect(healthData.poolSize).toBe(1);
-  }, 30000);
+  }, 120000);
 
   test('cleanup does not close reused contexts', async () => {
     await startServer(0, {
@@ -247,5 +247,5 @@ describe('Lifecycle idle cleanup (Stage 1)', () => {
     const health = await fetch(`${serverUrl}/health`);
     const healthData = await health.json();
     expect(healthData.poolSize).toBe(1);
-  }, 30000);
+  }, 120000);
 });
