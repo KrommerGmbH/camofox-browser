@@ -9,7 +9,7 @@ import type { ResolvedContextOptions } from '../utils/presets';
 import { contextHash } from '../utils/presets';
 import { contextPool, type PoolEntry } from './context-pool';
 import { cleanupUserDownloads } from './download';
-import { decrementActiveOps, incrementActiveOps } from './health';
+import { decrementActiveOps, incrementActiveOps, deleteUserHealth } from './health';
 import { stopVnc } from './vnc';
 import { cleanupTracing } from './tracing';
 
@@ -24,6 +24,20 @@ const sessionOwners = new Map<string, string>();
 // Avoids storing partially-initialized sessions (e.g., context: null cast) and dedupes concurrent creates.
 const launchingSessions = new Map<string, Promise<SessionData>>();
 const launchingSessionOwners = new Map<string, string>();
+
+type SessionRebindResult =
+	| { ok: true; session: SessionData }
+	| { ok: false; error: unknown };
+
+interface SessionRebindReservation {
+	token: string;
+	session: SessionData;
+	fromGeneration: string;
+	promise: Promise<SessionRebindResult>;
+	resolve: (result: SessionRebindResult) => void;
+}
+
+const sessionRebindReservations = new Map<string, SessionRebindReservation>();
 
 const lifecycleIdleClosures = new Map<string, { pending: number; promise: Promise<void>; resolve: () => void }>();
 
@@ -84,6 +98,87 @@ export function __getUserConcurrencyStateForTests(userId: string): { active: num
 
 export function __getSessionsMapForTests(): Map<string, SessionData> {
 	return sessions;
+}
+
+/**
+ * Test-only: returns the sessionOwners map so tests can link
+ * custom session keys to user IDs (needed for findTabById to
+ * recognize sessions with non-default keys).
+ */
+export function __getSessionOwnersForTests(): Map<string, string> {
+	return sessionOwners;
+}
+
+function createSessionRebindReservation(sessionMapKey: string, session: SessionData): SessionRebindReservation {
+	let resolve!: (result: SessionRebindResult) => void;
+	const promise = new Promise<SessionRebindResult>((r) => {
+		resolve = r;
+	});
+	const reservation: SessionRebindReservation = {
+		token: crypto.randomUUID(),
+		session,
+		fromGeneration: session.generation,
+		promise,
+		resolve,
+	};
+	sessionRebindReservations.set(sessionMapKey, reservation);
+	return reservation;
+}
+
+function cancelSessionRebindReservation(sessionMapKey: string, error: unknown): void {
+	const reservation = sessionRebindReservations.get(sessionMapKey);
+	if (!reservation) return;
+	sessionRebindReservations.delete(sessionMapKey);
+	reservation.resolve({ ok: false, error });
+}
+
+function cancelSessionRebindReservationsForCleanupKey(
+	cleanupKey: string,
+	allowInternalSessionKey: boolean,
+	error: Error,
+): void {
+	for (const sessionKey of Array.from(sessionRebindReservations.keys())) {
+		if (isSessionMapKeyForCleanupKey(sessionKey, cleanupKey, allowInternalSessionKey)) {
+			cancelSessionRebindReservation(sessionKey, error);
+		}
+	}
+}
+
+function contextNeedsRebind(session: SessionData, entry: PoolEntry | undefined): boolean {
+	if (!entry || entry.closing !== undefined || entry.generation !== session.generation || entry.context !== session.context) {
+		return true;
+	}
+	if (typeof entry.context.pages === 'function') {
+		try {
+			void entry.context.pages();
+		} catch {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Synchronous snapshot of a session's durable identity — owner and
+ * generation — captured before any await to prevent the replacement race.
+ *
+ * Returns `{ owner, generation }` where:
+ * - `owner` is the userId that owns this session key (from sessionOwners),
+ *   or `undefined` if the session key has no owner mapping.
+ * - `generation` is the session's opaque identity token (from SessionData),
+ *   or `undefined` if no session record exists.
+ *
+ * This is called by `closeContextBySession` before its first await so that
+ * `teardownSessionByKey` can validate the session's identity after the
+ * context-close await without reading a potentially-replaced session record.
+ */
+export function getSessionSnapshot(sessionMapKey: string): { owner: string | undefined; generation: string | undefined } {
+	const normalized = String(sessionMapKey);
+	const session = sessions.get(normalized);
+	return {
+		owner: sessionOwners.get(normalized),
+		generation: session?.generation,
+	};
 }
 
 function beginLifecycleIdleClosure(userId: unknown): () => void {
@@ -198,10 +293,15 @@ export function cleanupSessionsForUserId(
 
 	for (const [sessionKey, session] of Array.from(sessions.entries())) {
 		if (!isSessionMapKeyForCleanupKey(sessionKey, key, allowInternalSessionKey)) continue;
+		cancelSessionRebindReservation(sessionKey, new Error('Session cleaned up'));
 		ownerKeys.add(sessionOwners.get(sessionKey) ?? sessionKey);
 		unindexSessionTabs(session);
 		sessions.delete(sessionKey);
 		sessionOwners.delete(sessionKey);
+		// Evict per-session health entry so the map doesn't grow
+		// unbounded across normal session lifecycle. The health key
+		// is the sessionMapKey (or userId for legacy sessions).
+		deleteUserHealth(key, sessionKey);
 		log('info', 'session cleaned up', { userId: key, sessionKey, reason });
 	}
 
@@ -595,6 +695,7 @@ export async function rollbackSessionProfileRuntime(
 	const sessionMapKey = getSessionMapKey(userId, sessionKey, profileSignature);
 	const session = sessions.get(sessionMapKey);
 	if (session) {
+		cancelSessionRebindReservation(sessionMapKey, new Error('Session profile rolled back'));
 		unindexSessionTabs(session);
 		sessions.delete(sessionMapKey);
 	}
@@ -602,6 +703,168 @@ export async function rollbackSessionProfileRuntime(
 	launchingSessions.delete(sessionMapKey);
 	launchingSessionOwners.delete(sessionMapKey);
 	await contextPool.closeContext(sessionMapKey).catch(() => {});
+}
+
+/**
+ * Durable session identity captured synchronously by the caller before
+ * any await, to prevent the replacement race where a new session with the
+ * same key appears during the async gap.
+ */
+export interface SessionSnapshot {
+	/** The session owner (userId) at snapshot time, or undefined if no owner mapping. */
+	owner: string | undefined;
+	/** The session's opaque generation at snapshot time, or undefined if no session record. */
+	generation: string | undefined;
+}
+
+/**
+ * Tear down a single session by its sessionMapKey: unindex all tabs,
+ * delete the session entry, and close the backing context.
+ *
+ * This is the session-owned teardown used by nav recovery. Unlike
+ * closeContextBySession (which only removes the pool entry), this also
+ * removes the tab/session records from the index so findTabById can no
+ * longer return stale Page objects for the recovered session.
+ *
+ * Sibling sessions for the same user are preserved — only the exact
+ * sessionMapKey is torn down.
+ *
+ * Generation safety (HIGH B + HIGH C):
+ * - When `expectedContextGeneration` is provided (pool entry existed and
+ *   owner matched), the context is closed only if the exact immutable pool
+ *   generation still matches the committed session generation. This
+ *   prevents closing a replacement context that appeared during the await.
+ * - When `expectedContextGeneration` is undefined (pool entry was missing at
+ *   snapshot), stale session/tab records are cleaned up, but NO context
+ *   close is attempted. A new context may have appeared during the await
+ *   and must not be destroyed.
+ *
+ * Session record safety (HIGH C): the session's opaque `generation` is
+ * captured before any await. After the await, the session is only deleted
+ * if that exact generation still matches — preventing deletion of a
+ * replacement or rebound session that reused the same key.
+ *
+ * Durable session identity (HIGH C round 8): the caller passes a
+ * `sessionSnapshot` captured *before* the first await in
+ * closeContextBySession. This prevents the replacement race where
+ * teardownSessionByKey reads a session record that was replaced during
+ * an async gap. The snapshot's `generation` is used as the authoritative
+ * session identity; the snapshot's `owner` is
+ * validated against the requesting user for the pool-missing path.
+ *
+ * Foreign ownership (HIGH round 8): when the pool entry is missing
+ * (`expectedContextGeneration` is undefined), the session owner from the snapshot
+ * is compared against `expectedSessionOwner`. If they don't match, the
+ * call is a no-op — a foreign user must not delete another user's
+ * session records.
+ *
+ * Recovery lock safety (HIGH D): deleteUserHealth is NOT called here.
+ * Lock/health eviction is owned by handleNavFailure's finally block and
+ * by ordinary session lifecycle paths (cleanupSessionsForUserId,
+ * closeAllSessions, startCleanupInterval).
+ *
+ * Returns true if a session was found and torn down, false otherwise.
+ */
+export async function teardownSessionByKey(
+	sessionMapKey: string,
+	expectedContextGeneration?: string,
+	sessionSnapshot?: SessionSnapshot,
+): Promise<boolean> {
+	const normalized = String(sessionMapKey);
+	const session = sessions.get(normalized);
+	if (!session) return false;
+	if (sessionSnapshot && sessionSnapshot.generation === undefined) return false;
+
+	// Foreign ownership check (HIGH round 8): when the pool entry was
+	// missing at snapshot time, the session owner from the durable
+	// snapshot must match the requesting user. A foreign user must not
+	// delete another user's indexed session records.
+	if (sessionSnapshot && expectedContextGeneration === undefined) {
+		const snapshotOwner = sessionSnapshot.owner;
+		if (snapshotOwner !== undefined) {
+			// sessionOwners.get returns the current owner; compare against
+			// the snapshot owner to detect replacement. If the snapshot
+			// had no owner mapping, we cannot validate — proceed with
+			// caution (index cleanup only, no context close).
+			const currentOwner = sessionOwners.get(normalized);
+			if (currentOwner !== undefined && currentOwner !== snapshotOwner) {
+				log('warn', 'teardownSessionByKey: session owner replaced during await, aborting', {
+					sessionMapKey: normalized,
+					snapshotOwner,
+					currentOwner,
+				});
+				return false;
+			}
+		}
+	}
+
+	// Use the durable session generation from the snapshot if provided.
+	// Callers without a snapshot retain the direct teardown behavior by
+	// using the generation of the session they resolved above.
+	const sessionGeneration = sessionSnapshot ? sessionSnapshot.generation : session.generation;
+	const capturedPairMatches = expectedContextGeneration === undefined || sessionGeneration === expectedContextGeneration;
+
+	// Use generation-aware close to prevent the replacement race (HIGH B).
+	// When an exact context generation is provided and matches the captured
+	// committed session generation, close only that exact context entry.
+	// A mixed old-session/pending-new-context pair is never closed here.
+	// When expectedContextGeneration is undefined (pool entry was missing at
+	// snapshot), do NOT close any context — a new context may have
+	// appeared during the await and must not be destroyed.
+	if (expectedContextGeneration !== undefined && capturedPairMatches) {
+		await contextPool.closeContextIfMatches(normalized, expectedContextGeneration).catch(() => {});
+	}
+	// else: no pool entry at snapshot time → index cleanup only, no close.
+
+	// If a getSession rebind started from the captured session generation,
+	// wait for its reservation to commit or fail before deciding whether the
+	// old session record is still authoritative. This keeps committed
+	// SessionData identity unchanged while a replacement is only pending.
+	const pendingRebind = sessionRebindReservations.get(normalized);
+	if (pendingRebind && pendingRebind.session === session && pendingRebind.fromGeneration === sessionGeneration) {
+		await pendingRebind.promise;
+	}
+
+	// Re-check session identity after the await (HIGH C).
+	// If a replacement session replaced the old one during the await,
+	// leave it intact and only clean up the old session's tab index.
+	const currentSession = sessions.get(normalized);
+	if (!currentSession || currentSession.generation !== sessionGeneration) {
+		// The session was replaced during the await. Unindex the old
+		// session's tabs only when it is a distinct object. A rebound
+		// SessionData mutates in place, so unindexing it would also unindex
+		// the now-current healthy session.
+		if (currentSession !== session) unindexSessionTabs(session);
+		log('warn', 'teardownSessionByKey: session replaced during await, leaving new session intact', {
+			sessionMapKey: normalized,
+			oldGeneration: sessionGeneration,
+			newGeneration: currentSession?.generation,
+		});
+		return true;
+	}
+
+	// A captured mixed session/context pair fails closed while the newer
+	// context entry still exists. If its launch failed, ensureContext removes
+	// the entry and the stale old session can safely be cleaned below.
+	if (!capturedPairMatches && contextPool.getEntry(normalized)) {
+		log('warn', 'teardownSessionByKey: captured session/context generations differ, leaving session intact', {
+			sessionMapKey: normalized,
+			sessionGeneration,
+			contextGeneration: expectedContextGeneration,
+		});
+		return false;
+	}
+
+	// Same session — safe to delete session records.
+	unindexSessionTabs(currentSession);
+	sessions.delete(normalized);
+	sessionOwners.delete(normalized);
+	launchingSessions.delete(normalized);
+	launchingSessionOwners.delete(normalized);
+	sessionRebindReservations.delete(normalized);
+
+	log('info', 'session torn down by key (nav recovery)', { sessionMapKey: normalized, expectedContextGeneration });
+	return true;
 }
 
 export function getSessionsForUser(userId: unknown): Array<[string, SessionData]> {
@@ -762,6 +1025,8 @@ export async function createStagedSession(
 		context: entry.context,
 		tabGroups: new Map(),
 		lastAccess: Date.now(),
+		createdAt: Date.now(),
+		generation: entry.generation,
 	};
 
 	return { session, contextEntry: entry, generation };
@@ -846,7 +1111,13 @@ export async function getSession(
 				contextOptions,
 				runtimeProfile.resolvedProxy,
 			);
-			const created: SessionData = { context: entry.context, tabGroups: new Map(), lastAccess: Date.now() };
+			const created: SessionData = {
+				context: entry.context,
+				tabGroups: new Map(),
+				lastAccess: Date.now(),
+				createdAt: Date.now(),
+				generation: entry.generation,
+			};
 			sessions.set(runtimeProfile.sessionMapKey, created);
 			sessionOwners.set(runtimeProfile.sessionMapKey, key);
 			log('info', 'session created', { userId: key, sessionMapKey: runtimeProfile.sessionMapKey });
@@ -863,15 +1134,68 @@ export async function getSession(
 		}
 	} else {
 		// Re-resolve context on each access; ContextPool de-dupes launches and detects unexpected closes.
-		const entry = await contextPool.ensureContext(
-			runtimeProfile.profileKey,
-			key,
-			contextOptions,
-			runtimeProfile.resolvedProxy,
-		);
-		session.context = entry.context;
-		session.lastAccess = Date.now();
-		sessionOwners.set(runtimeProfile.sessionMapKey, key);
+		const currentEntry = contextPool.getEntry(runtimeProfile.profileKey);
+		if (contextNeedsRebind(session, currentEntry)) {
+			const existingRebind = sessionRebindReservations.get(runtimeProfile.sessionMapKey);
+			if (existingRebind) {
+				const result = await existingRebind.promise;
+				if (!result.ok) throw result.error;
+				result.session.lastAccess = Date.now();
+				return result.session;
+			}
+
+			const reservation = createSessionRebindReservation(runtimeProfile.sessionMapKey, session);
+			let result: SessionRebindResult;
+			try {
+				const entry = await contextPool.ensureContext(
+					runtimeProfile.profileKey,
+					key,
+					contextOptions,
+					runtimeProfile.resolvedProxy,
+				);
+
+				if (
+					sessionRebindReservations.get(runtimeProfile.sessionMapKey) !== reservation ||
+					sessions.get(runtimeProfile.sessionMapKey) !== session ||
+					session.generation !== reservation.fromGeneration
+				) {
+					await contextPool.closeContextIfMatches(runtimeProfile.profileKey, entry.generation).catch(() => {});
+					throw new Error('Session rebind superseded');
+				}
+
+				// Commit the context and its immutable generation together. Until
+				// this point SessionData still describes the previous context.
+				session.context = entry.context;
+				session.generation = entry.generation;
+				session.lastAccess = Date.now();
+				sessionOwners.set(runtimeProfile.sessionMapKey, key);
+				result = { ok: true, session };
+				return session;
+			} catch (error) {
+				result = { ok: false, error };
+				throw error;
+			} finally {
+				if (sessionRebindReservations.get(runtimeProfile.sessionMapKey) === reservation) {
+					sessionRebindReservations.delete(runtimeProfile.sessionMapKey);
+				}
+				reservation.resolve(result!);
+			}
+		} else {
+			const entry = await contextPool.ensureContext(
+				runtimeProfile.profileKey,
+				key,
+				contextOptions,
+				runtimeProfile.resolvedProxy,
+			);
+			// No await occurs between an unexpected replacement result and this
+			// commit, so bind the exact returned context generation atomically.
+			if (session.context !== entry.context || session.generation !== entry.generation) {
+				session.context = entry.context;
+				session.generation = entry.generation;
+			}
+			session.lastAccess = Date.now();
+			sessionOwners.set(runtimeProfile.sessionMapKey, key);
+		}
 	}
 
 	// For newly created sessions, lastAccess/context are already set.
@@ -889,6 +1213,9 @@ export function unindexTab(tabId: string): void {
 }
 
 export function clearAllState(): void {
+	for (const [sessionKey] of sessionRebindReservations) {
+		cancelSessionRebindReservation(sessionKey, new Error('Session state cleared'));
+	}
 	sessions.clear();
 	sessionOwners.clear();
 	launchingSessions.clear();
@@ -913,36 +1240,52 @@ export interface CloseSessionsForUserOptions {
 
 export async function closeSessionsForUser(userId: string, options: CloseSessionsForUserOptions = {}): Promise<void> {
 	const key = normalizeUserId(userId);
-	await contextPool.closeStagedContextByUserId(key).catch(() => {});
-	await contextPool.closeContextByUserId(key).catch(() => {});
-	cleanupSessionsForUserId(key, 'explicit_close', options.clearProfiles ?? true, { allowInternalSessionKey: false });
+	const releaseClosure = await contextPool.beginUserClosure(key);
+	try {
+		cancelSessionRebindReservationsForCleanupKey(key, false, new Error('Session explicitly closed'));
+		await contextPool.closeStagedContextByUserId(key).catch(() => {});
+		await contextPool.closeContextByUserId(key).catch(() => {});
+		cleanupSessionsForUserId(key, 'explicit_close', options.clearProfiles ?? true, { allowInternalSessionKey: false });
+	} finally {
+		releaseClosure();
+	}
 }
 
 export async function closeAllSessions(): Promise<void> {
-	await contextPool.closeAll().catch(() => {});
-	for (const [sessionKey, session] of sessions) {
-		const ownerUserId = sessionOwners.get(sessionKey) ?? sessionKey;
-		void stopVnc(ownerUserId).catch(() => {});
-		unindexSessionTabs(session);
-		sessions.delete(sessionKey);
-		sessionOwners.delete(sessionKey);
-		cleanupTracing(ownerUserId);
-		try {
-			cleanupUserDownloads(ownerUserId);
-		} catch {
-			// ignore
+	const releaseClosure = await contextPool.beginGlobalClosure();
+	try {
+		for (const sessionKey of Array.from(sessionRebindReservations.keys())) {
+			cancelSessionRebindReservation(sessionKey, new Error('All sessions closed'));
 		}
+		await contextPool.closeAll().catch(() => {});
+		for (const [sessionKey, session] of sessions) {
+			const ownerUserId = sessionOwners.get(sessionKey) ?? sessionKey;
+			void stopVnc(ownerUserId).catch(() => {});
+			unindexSessionTabs(session);
+			sessions.delete(sessionKey);
+			sessionOwners.delete(sessionKey);
+			// Evict per-session health entry on bulk close.
+			deleteUserHealth(ownerUserId, sessionKey);
+			cleanupTracing(ownerUserId);
+			try {
+				cleanupUserDownloads(ownerUserId);
+			} catch {
+				// ignore
+			}
+		}
+		launchingSessions.clear();
+		launchingSessionOwners.clear();
+		sessionOwners.clear();
+		canonicalProfiles.clear();
+		sessionProfiles.clear();
+		defaultSessionProfileClaims.clear();
+		for (const [, mutex] of sessionProfileCreateMutexes) mutex.resolve(false);
+		sessionProfileCreateMutexes.clear();
+		for (const [, mutex] of firstCreateMutexes) mutex.resolve(false);
+		firstCreateMutexes.clear();
+	} finally {
+		releaseClosure();
 	}
-	launchingSessions.clear();
-	launchingSessionOwners.clear();
-	sessionOwners.clear();
-	canonicalProfiles.clear();
-	sessionProfiles.clear();
-	defaultSessionProfileClaims.clear();
-	for (const [, mutex] of sessionProfileCreateMutexes) mutex.resolve(false);
-	sessionProfileCreateMutexes.clear();
-	for (const [, mutex] of firstCreateMutexes) mutex.resolve(false);
-	firstCreateMutexes.clear();
 }
 
 let cleanupInterval: NodeJS.Timeout | null = null;
@@ -953,6 +1296,7 @@ export function startCleanupInterval(): NodeJS.Timeout {
 		const now = Date.now();
 		for (const [sessionKey, session] of sessions) {
 			if (now - session.lastAccess > SESSION_TIMEOUT_MS) {
+				if (sessionRebindReservations.has(sessionKey)) continue;
 				const ownerUserId = sessionOwners.get(sessionKey) ?? sessionKey;
 				// Persistent profile is preserved on disk; closing the context frees resources.
 				contextPool.closeContext(sessionKey).catch(() => {});
@@ -960,6 +1304,8 @@ export function startCleanupInterval(): NodeJS.Timeout {
 				clearDefaultSessionProfileClaimsForUser(ownerUserId);
 				sessions.delete(sessionKey);
 				sessionOwners.delete(sessionKey);
+				// Evict per-session health entry on timeout expiry.
+				deleteUserHealth(ownerUserId, sessionKey);
 				cleanupTracing(ownerUserId);
 				log('info', 'session expired', { userId: ownerUserId, sessionKey });
 			}
@@ -1003,21 +1349,21 @@ export async function runLifecycleIdleCleanup(
 	}
 	
 	// Close only the specific contexts from the snapshot that were created before cleanup started
-	const contextsToClose: Array<{ profileKey: string; createdAt: number; lastAccess: number }> = [];
+	const contextsToClose: Array<{ profileKey: string; generation: string; lastAccess: number }> = [];
 	for (const [profileKey, entry] of contextSnapshot.entries()) {
 		// Skip staged, launching, or newly-created contexts
 		if (sessionKeysToCleanup.has(profileKey) && !entry.staged && !entry.launching && entry.createdAt < cleanupStartedMs) {
-			contextsToClose.push({ profileKey, createdAt: entry.createdAt, lastAccess: entry.lastAccess });
+			contextsToClose.push({ profileKey, generation: entry.generation, lastAccess: entry.lastAccess });
 		}
 	}
 	
 	// Close the specific contexts from the snapshot
 	const actuallyClosedSessionKeys = new Set<string>();
-	for (const { profileKey, createdAt, lastAccess } of contextsToClose) {
+	for (const { profileKey, generation, lastAccess } of contextsToClose) {
 		const entry = contextSnapshot.get(profileKey);
 		const releaseIdleClosure = entry ? beginLifecycleIdleClosure(entry.userId) : null;
 		try {
-			await contextPool.closeContextIfMatches(profileKey, createdAt, lastAccess);
+			await contextPool.closeContextIfMatches(profileKey, generation, lastAccess);
 			// Verify the context was actually closed (not skipped due to reuse)
 			const stillExists = contextPool.getEntry(profileKey);
 			if (!stillExists) {

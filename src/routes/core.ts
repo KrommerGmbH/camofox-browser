@@ -17,6 +17,8 @@ import {
 import { getAllPresets, resolveContextOptions, validateContextOptions } from '../utils/presets';
 import { contextPool, getDisplayForUser } from '../services/context-pool';
 import { lifecycleController } from '../services/lifecycle-controller';
+import { recordNavSuccess } from '../services/health';
+import { handleNavFailure } from '../services/nav-recovery';
 import { startVnc, stopVnc } from '../services/vnc';
 import {
 	MAX_TABS_PER_SESSION,
@@ -358,12 +360,18 @@ router.post(
 	) => {
 		let createUserId: string | undefined;
 		let createSessionKey: string | undefined;
+		let createSessionMapKey: string | undefined;
 		let createdSessionProfile = false;
 		let createdSessionProfileSignature: string | undefined;
 		let createdDefaultSessionProfileClaim = false;
 		let releaseSessionProfileCreate: ((committed: boolean) => void) | undefined;
 		let isFirstCreator = false;
 		let stagedGeneration: string | undefined;
+		// Track whether the error (if any) occurred during navigation
+		// vs. provisioning. Only navigation errors should be counted
+		// toward the nav failure threshold — provisioning errors
+		// (session creation, mutex, profile) are a different class.
+		let navError = false;
 		try {
 			if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
 				return res.status(403).json({ error: 'Forbidden' });
@@ -511,6 +519,7 @@ router.post(
 			const sessionMapKey = establishedProfile
 				? getSessionMapKey(userId, resolvedSessionKey, establishedProfile.signature)
 				: getSessionMapKey(userId, contextOverrides);
+			createSessionMapKey = sessionMapKey;
 			let tabId: string;
 			let pageUrl: string;
 
@@ -527,11 +536,15 @@ router.post(
 				markDownloadsStaged(tabId);
 
 				if (url) {
+					navError = true;
 					await navigateWithSafetyGuard(page, url, {
 						allowPrivateNetworkTargets: CONFIG.allowPrivateNetworkTargets,
 						waitUntil: 'domcontentloaded',
 						timeout: 30000,
 					});
+					navError = false;
+					// Record success immediately after navigation resolves.
+					recordNavSuccess(String(userId), sessionMapKey);
 					tabState.visitedUrls.add(url);
 				}
 
@@ -584,23 +597,27 @@ router.post(
 				registerDownloadListener(tabId, String(userId), page);
 
 				if (url) {
+					navError = true;
 					await navigateWithSafetyGuard(page, url, {
 						allowPrivateNetworkTargets: CONFIG.allowPrivateNetworkTargets,
 						waitUntil: 'domcontentloaded',
 						timeout: 30000,
 					});
+					navError = false;
+					// Record success immediately after navigation resolves.
+					recordNavSuccess(String(userId), sessionMapKey);
 					tabState.visitedUrls.add(url);
 				}
 
 				pageUrl = page.url();
-			}
+				}
 
-			log('info', 'tab created', {
+				log('info', 'tab created', {
 				reqId: req.reqId,
 				tabId,
 				userId,
 				sessionKey: resolvedSessionKey,
-				url: pageUrl,
+			url: pageUrl,
 			});
 			lifecycleController.recordInteractiveActivity();
 			releaseSessionProfileCreate?.(true);
@@ -629,6 +646,12 @@ router.post(
 			releaseSessionProfileCreate = undefined;
 			const message = err instanceof Error ? err.message : String(err);
 			log('error', 'tab create failed', { reqId: req.reqId, error: message });
+			// Only count navigation errors toward the failure threshold —
+			// provisioning errors (session creation, mutex, profile) are
+			// a different class and should not trigger browser recovery.
+			if (navError) {
+				await handleNavFailure(String(createUserId ?? ''), createSessionMapKey);
+			}
 			return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 		}
 	},
@@ -667,6 +690,8 @@ router.get('/tabs', async (req: Request<unknown, unknown, unknown, { userId?: un
 // Navigate
 router.post('/tabs/:tabId/navigate', async (req: Request<{ tabId: string }, unknown, { userId?: unknown; url?: string; macro?: string; query?: string }>, res: Response) => {
 	const tabId = req.params.tabId;
+	let navError = false;
+	let foundSessionKey: string | undefined;
 	try {
 		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
 			return res.status(403).json({ error: 'Forbidden' });
@@ -676,6 +701,7 @@ router.post('/tabs/:tabId/navigate', async (req: Request<{ tabId: string }, unkn
 		if (!userId) return res.status(400).json({ error: 'userId required' });
 		const found = findTabById(tabId, userId);
 		if (!found) return res.status(404).json({ error: 'Tab not found' });
+		foundSessionKey = found.sessionKey;
 
 		const { tabState } = found;
 		tabState.toolCalls++;
@@ -695,11 +721,22 @@ router.post('/tabs/:tabId/navigate', async (req: Request<{ tabId: string }, unkn
 					});
 					if (urlErr) return { status: 400 as const, body: { error: urlErr } };
 
+					// Arm navError only around the actual navigation attempt —
+					// limiter/timeout/lock, macro expansion, validation, and
+					// buildRefs failures are NOT navigation errors and must not
+					// advance the recovery threshold.
+					navError = true;
 					await navigateWithSafetyGuard(tabState.page, targetUrl, {
 						allowPrivateNetworkTargets: CONFIG.allowPrivateNetworkTargets,
 						waitUntil: 'domcontentloaded',
 						timeout: 30000,
 					});
+					navError = false;
+					// Record success immediately after navigation resolves —
+					// a buildRefs failure after this must NOT prevent the
+					// counter reset, since the navigation itself succeeded.
+					recordNavSuccess(String(req.body.userId), foundSessionKey);
+
 					tabState.visitedUrls.add(targetUrl);
 					tabState.refs = await buildRefs(tabState.page);
 					return { status: 200 as const, body: { ok: true, url: tabState.page.url() } };
@@ -717,6 +754,9 @@ router.post('/tabs/:tabId/navigate', async (req: Request<{ tabId: string }, unkn
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'navigate failed', { reqId: req.reqId, tabId, error: message });
+		if (navError) {
+			await handleNavFailure(String(req.body.userId ?? ''), foundSessionKey);
+		}
 		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });

@@ -1,5 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { type ChildProcess, spawn } from 'node:child_process';
 import { type Readable } from 'node:stream';
 
@@ -17,6 +18,7 @@ import { assertBrowserPlatformSupported, getHostArchitecture, getHostOS } from '
 import { resolveProfileDirForProfileKey } from '../utils/profile-path';
 import { readVersionedSidecar, writeVersionedSidecar } from '../utils/sidecar-version';
 import { log } from '../middleware/logging';
+
 import type { ResolvedProxyConfig } from '../types';
 
 const CONFIG = loadConfig();
@@ -31,7 +33,8 @@ export interface PoolEntry {
 	profileKey: string;
 	profileDir: string;
 	lastAccess: number;
-	createdAt: number;  // Timestamp when this entry was created
+	createdAt: number;  // Timestamp when this entry was created (temporal metadata only)
+	generation: string; // Immutable opaque identity for this exact context entry
 	launching?: Promise<BrowserContext>;
 	closing?: Promise<void>;
 	staged?: boolean;
@@ -247,6 +250,112 @@ export class ContextPool {
 	private pool: Map<string, PoolEntry> = new Map();
 	private headlessOverrides = new Map<string, boolean | 'virtual'>();
 	private onEvictCallbacks: Array<(userId: string) => void> = [];
+	private activeAdmissions = 0;
+	private activeAdmissionsByUser = new Map<string, number>();
+	private lifecycleEpoch = 0;
+	private lifecycleEpochByUser = new Map<string, number>();
+	private globalClosure: { pending: number; promise: Promise<void>; resolve: () => void; drained: Promise<void>; resolveDrained: () => void } | null = null;
+	private userClosures = new Map<string, { pending: number; promise: Promise<void>; resolve: () => void; drained: Promise<void>; resolveDrained: () => void }>();
+
+	private createClosureState(): { pending: number; promise: Promise<void>; resolve: () => void; drained: Promise<void>; resolveDrained: () => void } {
+		let resolve!: () => void;
+		let resolveDrained!: () => void;
+		return {
+			pending: 0,
+			promise: new Promise<void>((r) => { resolve = r; }),
+			resolve,
+			drained: new Promise<void>((r) => { resolveDrained = r; }),
+			resolveDrained,
+		};
+	}
+
+	private releaseAdmission(userId: string): void {
+		this.activeAdmissions--;
+		const remainingForUser = (this.activeAdmissionsByUser.get(userId) ?? 1) - 1;
+		if (remainingForUser <= 0) {
+			this.activeAdmissionsByUser.delete(userId);
+			this.userClosures.get(userId)?.resolveDrained();
+		} else {
+			this.activeAdmissionsByUser.set(userId, remainingForUser);
+		}
+		if (this.activeAdmissions <= 0) this.globalClosure?.resolveDrained();
+	}
+
+	private async acquireAdmission(userId: string): Promise<{ release: () => void; globalEpoch: number; userEpoch: number }> {
+		const normalized = String(userId);
+		for (;;) {
+			const globalFence = this.globalClosure;
+			const userFence = this.userClosures.get(normalized);
+			if (globalFence) await globalFence.promise;
+			if (userFence) await userFence.promise;
+
+			this.activeAdmissions++;
+			this.activeAdmissionsByUser.set(normalized, (this.activeAdmissionsByUser.get(normalized) ?? 0) + 1);
+			if (!this.globalClosure && !this.userClosures.has(normalized)) {
+				let released = false;
+				const release = (): void => {
+					if (released) return;
+					released = true;
+					this.releaseAdmission(normalized);
+				};
+				return {
+					release,
+					globalEpoch: this.lifecycleEpoch,
+					userEpoch: this.lifecycleEpochByUser.get(normalized) ?? 0,
+				};
+			}
+			this.releaseAdmission(normalized);
+		}
+	}
+
+	async beginUserClosure(userId: string): Promise<() => void> {
+		const normalized = String(userId);
+		let state = this.userClosures.get(normalized);
+		if (!state) {
+			this.lifecycleEpochByUser.set(normalized, (this.lifecycleEpochByUser.get(normalized) ?? 0) + 1);
+			state = this.createClosureState();
+			this.userClosures.set(normalized, state);
+			if ((this.activeAdmissionsByUser.get(normalized) ?? 0) === 0) state.resolveDrained();
+		}
+		state.pending++;
+		await state.drained;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			const current = this.userClosures.get(normalized);
+			if (!current) return;
+			current.pending--;
+			if (current.pending <= 0) {
+				this.userClosures.delete(normalized);
+				current.resolve();
+			}
+		};
+	}
+
+	async beginGlobalClosure(): Promise<() => void> {
+		let state = this.globalClosure;
+		if (!state) {
+			this.lifecycleEpoch++;
+			state = this.createClosureState();
+			this.globalClosure = state;
+			if (this.activeAdmissions === 0) state.resolveDrained();
+		}
+		state.pending++;
+		await state.drained;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			const current = this.globalClosure;
+			if (!current) return;
+			current.pending--;
+			if (current.pending <= 0) {
+				this.globalClosure = null;
+				current.resolve();
+			}
+		};
+	}
 
 	onEvict(callback: (userId: string) => void): void {
 		this.onEvictCallbacks.push(callback);
@@ -566,6 +675,31 @@ export class ContextPool {
 		staged = false,
 		stagedGeneration?: string,
 	): Promise<PoolEntry> {
+		const admission = await this.acquireAdmission(userId);
+		try {
+			const entry = await this.ensureContextAdmitted(profileKey, userId, options, resolvedProxy, staged, stagedGeneration);
+			const normalized = String(userId);
+			if (
+				admission.globalEpoch !== this.lifecycleEpoch ||
+				admission.userEpoch !== (this.lifecycleEpochByUser.get(normalized) ?? 0)
+			) {
+				await this.closeContextIfMatches(profileKey, entry.generation).catch(() => {});
+				throw new Error('Context admission superseded by session closure');
+			}
+			return entry;
+		} finally {
+			admission.release();
+		}
+	}
+
+	private async ensureContextAdmitted(
+		profileKey: string,
+		userId: string,
+		options?: BrowserContextOptions,
+		resolvedProxy?: ResolvedProxyConfig | null,
+		staged = false,
+		stagedGeneration?: string,
+	): Promise<PoolEntry> {
 		const normalized = String(userId);
 		let entry = this.pool.get(profileKey);
 		const seed = pickSeedOptions(options);
@@ -622,6 +756,7 @@ export class ContextPool {
 			profileDir,
 			lastAccess: Date.now(),
 			createdAt: Date.now(),
+			generation: crypto.randomUUID(),
 			staged,
 			stagedGeneration,
 			proxyConfig: resolvedProxy || null,
@@ -637,13 +772,17 @@ export class ContextPool {
 				context.on('close', () => {
 					this.cleanupVirtualDisplay(newEntry);
 					log('info', 'persistent context closed', { userId: normalized, profileKey, profileDir });
-					this.pool.delete(profileKey);
+					if (this.pool.get(profileKey) === newEntry) {
+						this.pool.delete(profileKey);
+					}
 				});
 				return context;
 			})
 			.catch((err) => {
 				this.cleanupVirtualDisplay(newEntry);
-				this.pool.delete(profileKey);
+				if (this.pool.get(profileKey) === newEntry) {
+					this.pool.delete(profileKey);
+				}
 				const message = err instanceof Error ? err.message : String(err);
 				log('error', 'persistent context launch failed', { userId: normalized, profileKey, profileDir, error: message });
 				throw err;
@@ -686,11 +825,130 @@ export class ContextPool {
 		await entry.closing;
 	}
 
-	async closeContextIfMatches(profileKey: string, expectedCreatedAt: number, expectedLastAccess?: number): Promise<void> {
+	/**
+	 * Close the context backing a specific session/profile for a user, but
+	 * only that one — never unrelated sessions belonging to the same user.
+	 *
+	 * This is the blast-radius fix for nav recovery: a single failing tab's
+	 * session is torn down without terminating the user's other sessions.
+	 * The `profileKey` is the pool key (which is the sessionMapKey for
+	 * established session profiles).
+	 *
+	 * Fail-closed semantics: when an explicit `profileKey` is provided but
+	 * does not map to a matching context owned by this user, the call is a
+	 * no-op — it does NOT fall back to user-wide close. A stale route key
+	 * must never close every sibling session. User-wide fallback is reserved
+	 * for genuinely legacy callers that pass no profile key at all.
+	 */
+	async closeContextBySession(userId: string, profileKey?: string): Promise<void> {
+		const normalizedUser = String(userId);
+		if (profileKey !== undefined && profileKey !== null && profileKey !== '') {
+			const normalizedProfile = String(profileKey);
+
+			// Capture the current pool entry's immutable generation before
+			// any await. This prevents the replacement race: if a new entry
+			// with the same key appears during teardown, the generation check
+			// below will NOT close the newer
+			// healthy context.
+			const entry = this.pool.get(normalizedProfile);
+
+			// HIGH A — Foreign owner: the pool entry exists but is owned by
+			// a different user. This is a fail-closed no-op. A foreign key
+			// must never tear down another user's session/context.
+			if (entry && entry.userId !== normalizedUser) {
+				log('warn', 'closeContextBySession: foreign owner, no-op', {
+					requestedUser: normalizedUser,
+					actualOwner: entry.userId,
+					profileKey: normalizedProfile,
+				});
+				return;
+			}
+
+			// Staged entries are not eligible for recovery teardown.
+			if (entry && entry.staged) {
+				log('warn', 'closeContextBySession: staged entry, no-op', {
+					profileKey: normalizedProfile,
+				});
+				return;
+			}
+
+			// If the pool entry exists and the owner matches, capture its
+			// immutable opaque generation for safe teardown.
+			// If the pool entry is missing, generation is undefined — meaning
+			// "clean stale session/tab index records only; do NOT close any
+			// context, because a new context may have appeared during the
+			// await and must not be destroyed" (HIGH B).
+			const generation = entry?.generation;
+
+			// Resolve session.ts lazily to avoid the top-level circular dependency,
+			// but do it synchronously so the durable session snapshot is captured
+			// before this method's first await.
+			const { getSessionSnapshot, teardownSessionByKey } = require('./session') as typeof import('./session');
+
+			// Capture the durable session identity (owner + session generation)
+			// synchronously, before teardownSessionByKey's internal await
+			// (HIGH round 8). This prevents the replacement race where a new
+			// session with the same key appears during the context-close await
+			// inside teardownSessionByKey. The snapshot's opaque generation is
+			// authoritative for session identity; the snapshot's owner is
+			// validated against the requesting user for the pool-missing path.
+			const sessionSnapshot = getSessionSnapshot(normalizedProfile);
+
+			// Foreign ownership check for the pool-missing path (HIGH round 8):
+			// When the pool entry is already gone, the pool-level owner check
+			// above could not fire. The durable session snapshot's owner tells
+			// us who the session belongs to. If the snapshot owner doesn't
+			// match the requesting user, this is a foreign call — fail closed.
+			// A foreign user must not delete another user's indexed session
+			// records when the pool entry is missing.
+			if (generation === undefined && sessionSnapshot.owner !== undefined && sessionSnapshot.owner !== normalizedUser) {
+				log('warn', 'closeContextBySession: pool entry missing and session owner is foreign, no-op', {
+					requestedUser: normalizedUser,
+					sessionOwner: sessionSnapshot.owner,
+					profileKey: normalizedProfile,
+				});
+				return;
+			}
+
+			// Full session teardown: unindex tabs, delete session entry,
+			// AND close the backing context (only when generation is known).
+			// When the pool entry is missing, session/tab records are still
+			// cleaned up so findTabById stops returning stale Page objects,
+			// but no context close is attempted (HIGH B).
+			//
+			// The session snapshot is passed through so teardownSessionByKey
+			// can validate the session owner (foreign-ownership fail-closed)
+			// and the session generation (replacement race prevention).
+			await teardownSessionByKey(normalizedProfile, generation, sessionSnapshot);
+
+			return;
+		}
+		// No profile key provided — legacy caller without session identity.
+		// Only in this case do we fall back to user-wide close.
+		await this.closeContextByUserId(normalizedUser);
+	}
+
+	/**
+	 * Close all non-staged contexts for a user (user-wide recovery fallback).
+	 */
+	async closeContextByUserId(userId: string): Promise<void> {
+		const normalized = String(userId);
+		const entriesToClose: string[] = [];
+		for (const [profileKey, entry] of this.pool.entries()) {
+			if (entry.userId === normalized && !entry.staged) {
+				entriesToClose.push(profileKey);
+			}
+		}
+		for (const profileKey of entriesToClose) {
+			await this.closeContext(profileKey);
+		}
+	}
+
+	async closeContextIfMatches(profileKey: string, expectedGeneration: string, expectedLastAccess?: number): Promise<void> {
 		const normalized = String(profileKey);
 		const entry = this.pool.get(normalized);
 		if (!entry) return;
-		if (entry.createdAt !== expectedCreatedAt) return;
+		if (entry.generation !== expectedGeneration) return;
 		// If lastAccess was provided and has changed, the context was reused - don't close
 		if (expectedLastAccess !== undefined && entry.lastAccess !== expectedLastAccess) return;
 		await this.closeContext(normalized);
@@ -708,20 +966,6 @@ export class ContextPool {
 		entry.staged = false;
 		entry.stagedGeneration = undefined;
 		await this.closeContext(normalized);
-	}
-
-	async closeContextByUserId(userId: string): Promise<void> {
-		const normalized = String(userId);
-		// Close all contexts for this userId
-		const entriesToClose: string[] = [];
-		for (const [profileKey, entry] of this.pool.entries()) {
-			if (entry.userId === normalized && !entry.staged) {
-				entriesToClose.push(profileKey);
-			}
-		}
-		for (const profileKey of entriesToClose) {
-			await this.closeContext(profileKey);
-		}
 	}
 
 	async closeStagedContextByUserId(userId: string, generation?: string): Promise<void> {

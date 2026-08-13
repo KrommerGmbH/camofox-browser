@@ -17,6 +17,8 @@ import { loadConfig } from '../utils/config';
 import { closeBrowser } from '../services/browser';
 import { contextPool } from '../services/context-pool';
 import { lifecycleController } from '../services/lifecycle-controller';
+import { recordNavSuccess } from '../services/health';
+import { handleNavFailure } from '../services/nav-recovery';
 import { registerDownloadListener } from '../services/download';
 import {
 	MAX_TABS_PER_SESSION,
@@ -82,7 +84,6 @@ function getRouteErrorStatus(err: unknown): number {
 	return 500;
 }
 
-
 type LoadStateLike = 'load' | 'domcontentloaded' | 'networkidle';
 
 function isLoadState(value: string): value is LoadStateLike {
@@ -127,6 +128,8 @@ router.post('/tabs/open', async (req: Request<unknown, unknown, { url?: string; 
 	let createdSessionProfileSignature: string | undefined;
 	let createdDefaultSessionProfileClaim = false;
 	let releaseSessionProfileCreate: ((committed: boolean) => void) | undefined;
+	let navError = false;
+	let openSessionMapKey: string | undefined;
 	try {
 		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req as unknown as Request, CONFIG.apiKey)) {
 			return res.status(403).json({ error: 'Forbidden' });
@@ -247,12 +250,23 @@ router.post('/tabs/open', async (req: Request<unknown, unknown, { url?: string; 
 		group.set(tabId, tabState);
 		indexTab(tabId, sessionMapKey);
 		registerDownloadListener(tabId, String(userId), page);
+		openSessionMapKey = sessionMapKey;
 
+		// Arm navError only around the actual navigation attempt —
+		// provisioning, profile, limiter, validation, and acquirePage
+		// failures are NOT navigation errors and must not advance the
+		// recovery threshold.
+		navError = true;
 		await navigateWithSafetyGuard(page, url, {
 			allowPrivateNetworkTargets: CONFIG.allowPrivateNetworkTargets,
 			waitUntil: 'domcontentloaded',
 			timeout: 30000,
 		});
+		navError = false;
+		// Record success immediately after navigation resolves —
+		// a post-navigation failure (title, visitedUrls) must NOT
+		// prevent the counter reset, since the navigation itself succeeded.
+		recordNavSuccess(String(userId), sessionMapKey);
 		tabState.visitedUrls.add(url);
 
 		log('info', 'openclaw tab opened', { reqId: req.reqId, tabId, url: page.url() });
@@ -282,6 +296,9 @@ router.post('/tabs/open', async (req: Request<unknown, unknown, { url?: string; 
 		releaseSessionProfileCreate = undefined;
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'openclaw tab open failed', { reqId: req.reqId, error: message });
+		if (navError) {
+			await handleNavFailure(String(profileUserId ?? ''), openSessionMapKey);
+		}
 		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });
@@ -313,6 +330,8 @@ router.post('/stop', async (req: Request, res: Response) => {
 
 // POST /navigate - Navigate (OpenClaw format with targetId in body)
 router.post('/navigate', async (req: Request<unknown, unknown, { targetId?: string; url?: string; macro?: string; query?: string; userId?: unknown }>, res: Response) => {
+	let navError = false;
+	let foundSessionKey: string | undefined;
 	try {
 		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req as unknown as Request, CONFIG.apiKey)) {
 			return res.status(403).json({ error: 'Forbidden' });
@@ -330,6 +349,7 @@ router.post('/navigate', async (req: Request<unknown, unknown, { targetId?: stri
 		if (!found) {
 			return res.status(404).json({ error: 'Tab not found' });
 		}
+		foundSessionKey = found.sessionKey;
 
 		const { tabState } = found;
 		tabState.toolCalls++;
@@ -349,11 +369,22 @@ router.post('/navigate', async (req: Request<unknown, unknown, { targetId?: stri
 					});
 					if (urlErr) return { status: 400 as const, body: { error: urlErr } };
 
+					// Arm navError only around the actual navigation attempt —
+					// limiter/timeout/lock, macro expansion, validation, and
+					// buildRefs failures are NOT navigation errors and must not
+					// advance the recovery threshold.
+					navError = true;
 					await navigateWithSafetyGuard(tabState.page, targetUrl, {
 						allowPrivateNetworkTargets: CONFIG.allowPrivateNetworkTargets,
 						waitUntil: 'domcontentloaded',
 						timeout: 30000,
 					});
+					navError = false;
+					// Record success immediately after navigation resolves —
+					// a buildRefs failure after this must NOT prevent the
+					// counter reset, since the navigation itself succeeded.
+					recordNavSuccess(String(userId), foundSessionKey);
+
 					tabState.visitedUrls.add(targetUrl);
 					tabState.refs = await buildRefs(tabState.page);
 					return { status: 200 as const, body: { ok: true, targetId, url: tabState.page.url() } };
@@ -369,6 +400,9 @@ router.post('/navigate', async (req: Request<unknown, unknown, { targetId?: stri
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'openclaw navigate failed', { reqId: req.reqId, error: message });
+		if (navError) {
+			await handleNavFailure(String(req.body.userId ?? ''), foundSessionKey);
+		}
 		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });
