@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-## [2.4.7] - 2026-08-11
+## [2.4.7] - 2026-08-13
 
 ### Added
 - Added official Windows x64 headless support and a reproducible portable ZIP build that bundles Node.js, the application runtime, the pinned Camoufox Windows x64 engine, portable runtime state under `data\home`, and third-party licensing notices.
@@ -19,11 +19,14 @@
 ### Fixed
 - Windows now rejects headed and virtual/Xvfb/VNC display modes before Linux-only display processes can be attempted, while preserving existing Linux/macOS display behavior.
 - New Windows persistent profile directories now use deterministic hashed internal keys, preventing distinct case-sensitive user/session identities from aliasing on case-insensitive Windows filesystems while leaving Linux/macOS profile naming unchanged. Existing Windows directories from the previous layout remain readable in place when the exact legacy name is unambiguous; if both old and hashed directories exist, or Windows resolves a different case/trailing-dot/space-equivalent legacy name, profile launch fails closed and reports the paths to back up/reconcile instead of silently choosing or migrating state.
+- Navigation health recovery now tracks failures per session, counts only actual navigation failures, preserves unrelated sibling sessions, and applies the same recovery behavior to core and OpenClaw tab-opening routes.
+- Concurrent recovery teardown and same-key context relaunch now use opaque session generations and exact context identity guards, preserving a healthy replacement session even when timestamps collide or lifecycle callbacks arrive late.
 
 ### Tests
 - Added focused Windows platform and VNC side-effect regression tests plus a launcher test that removes Node from `PATH` and verifies the current runtime is reused.
 - Jest now isolates profiles, cookies, downloads, and traces under a disposable temp root and removes it after the run, preventing test/build verification from accumulating persistent state under the operator's `~/.camofox` directory.
 - Long-running session lifecycle coverage now reclaims its disposable profiles/downloads/cookies/traces after each fully closed case, preventing in-run profile buildup from exhausting Windows CI while retaining every lifecycle assertion.
+- Added production-boundary lifecycle regressions for recovery/relaunch overlap and equal-timestamp collisions, plus real Express coverage for OpenClaw `POST /tabs/open` recovery thresholds, success resets, and non-navigation isolation.
 
 ## [2.4.6] - 2026-06-17
 
