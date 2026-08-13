@@ -21,6 +21,7 @@ const mockEnsureContext = jest.fn(async (profileKey, userId) => ({
   profileDir: `/tmp/${profileKey}`,
   lastAccess: Date.now(),
   createdAt: Date.now(),
+  generation: `generation:${profileKey}`,
 }));
 const mockGetEntry = jest.fn();
 const mockCloseContext = jest.fn(async () => {});
@@ -39,6 +40,9 @@ jest.mock('../../dist/src/services/context-pool', () => ({
     closeContextByUserId: jest.fn(async () => {}),
     closeContext: mockCloseContext,
     closeAll: jest.fn(async () => {}),
+    beginUserClosure: jest.fn(async () => () => {}),
+    beginGlobalClosure: jest.fn(async () => () => {}),
+    closeContextIfMatches: jest.fn(async () => {}),
   },
 }));
 

@@ -411,6 +411,103 @@ describe('ContextPool.closeContextBySession production boundary', () => {
     expect(contextPool.getEntry(sessionKey)).toBeUndefined();
   });
 
+  test.each([
+    ['explicit close', (userId) => sessionModule.closeSessionsForUser(userId)],
+    ['bulk close', () => sessionModule.closeAllSessions()],
+  ])('%s fences a rebind that starts after teardown begins', async (_label, closeSessions) => {
+    const userId = `late-rebind-${_label.replace(/\s/g, '-')}`;
+    const sessionKey = sessionModule.getSessionMapKey(userId, null);
+    const sessions = sessionModule.__getSessionsMapForTests();
+    const sessionOwners = sessionModule.__getSessionOwnersForTests();
+    const closeGate = deferred();
+    const oldContext = makeContext();
+    oldContext.close.mockReturnValueOnce(closeGate.promise);
+    const oldSession = makeSession(oldContext, 1000, `${userId}-old-tab`, 'late-rebind-old');
+    sessions.set(sessionKey, oldSession);
+    sessionOwners.set(sessionKey, userId);
+    contextPool.pool.set(sessionKey, makePoolEntry(userId, sessionKey, oldContext, 1000, 'late-rebind-old'));
+
+    const closePromise = closeSessions(userId);
+    await waitFor(() => contextPool.getEntry(sessionKey)?.closing !== undefined);
+
+    const replacementContext = makeContext();
+    firefox.launchPersistentContext.mockResolvedValueOnce(replacementContext);
+    const getPromise = sessionModule.getSession(userId);
+    expect(firefox.launchPersistentContext).not.toHaveBeenCalled();
+
+    closeGate.resolve();
+    await closePromise;
+    await expect(getPromise).rejects.toThrow(/superseded|closure/i);
+
+    expect(replacementContext.close).toHaveBeenCalledTimes(1);
+    expect(sessions.has(sessionKey)).toBe(false);
+    expect(sessionOwners.has(sessionKey)).toBe(false);
+    expect(contextPool.getEntry(sessionKey)).toBeUndefined();
+  });
+
+  test('concurrent bulk closes share the global fence until both complete', async () => {
+    const userId = 'concurrent-global-close-owner';
+    const sessionKey = sessionModule.getSessionMapKey(userId, null);
+    const closeGate = deferred();
+    const oldContext = makeContext();
+    oldContext.close.mockReturnValueOnce(closeGate.promise);
+    const oldSession = makeSession(oldContext, 1000, 'concurrent-global-close-tab', 'concurrent-global-close-old');
+    sessionModule.__getSessionsMapForTests().set(sessionKey, oldSession);
+    sessionModule.__getSessionOwnersForTests().set(sessionKey, userId);
+    contextPool.pool.set(sessionKey, makePoolEntry(userId, sessionKey, oldContext, 1000, 'concurrent-global-close-old'));
+
+    const firstClose = sessionModule.closeAllSessions();
+    const secondClose = sessionModule.closeAllSessions();
+    await waitFor(() => contextPool.getEntry(sessionKey)?.closing !== undefined);
+
+    const replacementContext = makeContext();
+    firefox.launchPersistentContext.mockResolvedValueOnce(replacementContext);
+    const getPromise = sessionModule.getSession(userId);
+    expect(firefox.launchPersistentContext).not.toHaveBeenCalled();
+
+    closeGate.resolve();
+    await Promise.all([firstClose, secondClose]);
+    await expect(getPromise).rejects.toThrow(/superseded|closure/i);
+    expect(replacementContext.close).toHaveBeenCalledTimes(1);
+    expect(contextPool.getEntry(sessionKey)).toBeUndefined();
+  });
+
+  test.each([
+    ['staged first-use', true],
+    ['internal context', false],
+  ])('global closure gates %s launches at ContextPool admission', async (_label, staged) => {
+    const blockerUser = `global-gate-blocker-${_label}`;
+    const blockerKey = `global-gate-blocker-key-${_label}`;
+    const closeGate = deferred();
+    const blockerContext = makeContext();
+    blockerContext.close.mockReturnValueOnce(closeGate.promise);
+    contextPool.pool.set(blockerKey, makePoolEntry(blockerUser, blockerKey, blockerContext, 1000, `blocker:${_label}`));
+
+    const closePromise = sessionModule.closeAllSessions();
+    await waitFor(() => contextPool.getEntry(blockerKey)?.closing !== undefined);
+
+    const launchUser = `global-gate-launch-${_label}`;
+    const launchKey = `global-gate-launch-key-${_label}`;
+    const launchedContext = makeContext();
+    firefox.launchPersistentContext.mockResolvedValueOnce(launchedContext);
+    const launchPromise = contextPool.ensureContext(
+      launchKey,
+      launchUser,
+      undefined,
+      undefined,
+      staged,
+      staged ? `staged:${_label}` : undefined,
+    );
+    expect(firefox.launchPersistentContext).not.toHaveBeenCalled();
+
+    closeGate.resolve();
+    await closePromise;
+    const entry = await launchPromise;
+
+    expect(entry.context).toBe(launchedContext);
+    expect(contextPool.getEntry(launchKey)).toBe(entry);
+  });
+
   test('timeout cleanup skips a session while its replacement rebind is pending', async () => {
     jest.useFakeTimers();
     try {
@@ -445,6 +542,12 @@ describe('ContextPool.closeContextBySession production boundary', () => {
       expect(rebound.context).toBe(replacementContext);
       expect(sessions.get(sessionKey)).toBe(originalSession);
       expect(sessionModule.findTabById(tabId, userId)).not.toBeNull();
+
+      rebound.lastAccess = Date.now() - 600_001;
+      jest.advanceTimersByTime(60_000);
+      expect(sessions.has(sessionKey)).toBe(false);
+      expect(sessionOwners.has(sessionKey)).toBe(false);
+      expect(sessionModule.findTabById(tabId, userId)).toBeNull();
     } finally {
       sessionModule.stopCleanupInterval();
       jest.useRealTimers();
@@ -478,6 +581,25 @@ describe('ContextPool.closeContextBySession production boundary', () => {
     oldCloseListener();
     expect(contextPool.getEntry(sessionKey)).toBe(replacementEntry);
     expect(replacementEntry.context).toBe(replacementContext);
+  });
+
+  test('stale context launch failure cannot remove a newer same-key pool entry', async () => {
+    const userId = 'stale-launch-owner';
+    const sessionKey = 'stale-launch-session';
+    const launchGate = deferred();
+    firefox.launchPersistentContext.mockReturnValueOnce(launchGate.promise);
+
+    const staleLaunch = contextPool.ensureContext(sessionKey, userId);
+    await waitFor(() => contextPool.getEntry(sessionKey)?.launching !== undefined);
+    const staleEntry = contextPool.getEntry(sessionKey);
+    const replacementContext = makeContext();
+    const replacementEntry = makePoolEntry(userId, sessionKey, replacementContext, 2000, 'replacement-generation');
+    contextPool.pool.set(sessionKey, replacementEntry);
+
+    launchGate.reject(new Error('stale launch failed'));
+    await expect(staleLaunch).rejects.toThrow('stale launch failed');
+    expect(contextPool.getEntry(sessionKey)).toBe(replacementEntry);
+    expect(contextPool.getEntry(sessionKey)).not.toBe(staleEntry);
   });
 
   test('fails closed for a foreign owner when the pool entry is missing', async () => {

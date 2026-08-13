@@ -1159,6 +1159,7 @@ export async function getSession(
 					sessions.get(runtimeProfile.sessionMapKey) !== session ||
 					session.generation !== reservation.fromGeneration
 				) {
+					await contextPool.closeContextIfMatches(runtimeProfile.profileKey, entry.generation).catch(() => {});
 					throw new Error('Session rebind superseded');
 				}
 
@@ -1239,42 +1240,52 @@ export interface CloseSessionsForUserOptions {
 
 export async function closeSessionsForUser(userId: string, options: CloseSessionsForUserOptions = {}): Promise<void> {
 	const key = normalizeUserId(userId);
-	cancelSessionRebindReservationsForCleanupKey(key, false, new Error('Session explicitly closed'));
-	await contextPool.closeStagedContextByUserId(key).catch(() => {});
-	await contextPool.closeContextByUserId(key).catch(() => {});
-	cleanupSessionsForUserId(key, 'explicit_close', options.clearProfiles ?? true, { allowInternalSessionKey: false });
+	const releaseClosure = await contextPool.beginUserClosure(key);
+	try {
+		cancelSessionRebindReservationsForCleanupKey(key, false, new Error('Session explicitly closed'));
+		await contextPool.closeStagedContextByUserId(key).catch(() => {});
+		await contextPool.closeContextByUserId(key).catch(() => {});
+		cleanupSessionsForUserId(key, 'explicit_close', options.clearProfiles ?? true, { allowInternalSessionKey: false });
+	} finally {
+		releaseClosure();
+	}
 }
 
 export async function closeAllSessions(): Promise<void> {
-	for (const sessionKey of Array.from(sessionRebindReservations.keys())) {
-		cancelSessionRebindReservation(sessionKey, new Error('All sessions closed'));
-	}
-	await contextPool.closeAll().catch(() => {});
-	for (const [sessionKey, session] of sessions) {
-		const ownerUserId = sessionOwners.get(sessionKey) ?? sessionKey;
-		void stopVnc(ownerUserId).catch(() => {});
-		unindexSessionTabs(session);
-		sessions.delete(sessionKey);
-		sessionOwners.delete(sessionKey);
-		// Evict per-session health entry on bulk close.
-		deleteUserHealth(ownerUserId, sessionKey);
-		cleanupTracing(ownerUserId);
-		try {
-			cleanupUserDownloads(ownerUserId);
-		} catch {
-			// ignore
+	const releaseClosure = await contextPool.beginGlobalClosure();
+	try {
+		for (const sessionKey of Array.from(sessionRebindReservations.keys())) {
+			cancelSessionRebindReservation(sessionKey, new Error('All sessions closed'));
 		}
+		await contextPool.closeAll().catch(() => {});
+		for (const [sessionKey, session] of sessions) {
+			const ownerUserId = sessionOwners.get(sessionKey) ?? sessionKey;
+			void stopVnc(ownerUserId).catch(() => {});
+			unindexSessionTabs(session);
+			sessions.delete(sessionKey);
+			sessionOwners.delete(sessionKey);
+			// Evict per-session health entry on bulk close.
+			deleteUserHealth(ownerUserId, sessionKey);
+			cleanupTracing(ownerUserId);
+			try {
+				cleanupUserDownloads(ownerUserId);
+			} catch {
+				// ignore
+			}
+		}
+		launchingSessions.clear();
+		launchingSessionOwners.clear();
+		sessionOwners.clear();
+		canonicalProfiles.clear();
+		sessionProfiles.clear();
+		defaultSessionProfileClaims.clear();
+		for (const [, mutex] of sessionProfileCreateMutexes) mutex.resolve(false);
+		sessionProfileCreateMutexes.clear();
+		for (const [, mutex] of firstCreateMutexes) mutex.resolve(false);
+		firstCreateMutexes.clear();
+	} finally {
+		releaseClosure();
 	}
-	launchingSessions.clear();
-	launchingSessionOwners.clear();
-	sessionOwners.clear();
-	canonicalProfiles.clear();
-	sessionProfiles.clear();
-	defaultSessionProfileClaims.clear();
-	for (const [, mutex] of sessionProfileCreateMutexes) mutex.resolve(false);
-	sessionProfileCreateMutexes.clear();
-	for (const [, mutex] of firstCreateMutexes) mutex.resolve(false);
-	firstCreateMutexes.clear();
 }
 
 let cleanupInterval: NodeJS.Timeout | null = null;

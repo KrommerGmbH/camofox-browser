@@ -250,6 +250,112 @@ export class ContextPool {
 	private pool: Map<string, PoolEntry> = new Map();
 	private headlessOverrides = new Map<string, boolean | 'virtual'>();
 	private onEvictCallbacks: Array<(userId: string) => void> = [];
+	private activeAdmissions = 0;
+	private activeAdmissionsByUser = new Map<string, number>();
+	private lifecycleEpoch = 0;
+	private lifecycleEpochByUser = new Map<string, number>();
+	private globalClosure: { pending: number; promise: Promise<void>; resolve: () => void; drained: Promise<void>; resolveDrained: () => void } | null = null;
+	private userClosures = new Map<string, { pending: number; promise: Promise<void>; resolve: () => void; drained: Promise<void>; resolveDrained: () => void }>();
+
+	private createClosureState(): { pending: number; promise: Promise<void>; resolve: () => void; drained: Promise<void>; resolveDrained: () => void } {
+		let resolve!: () => void;
+		let resolveDrained!: () => void;
+		return {
+			pending: 0,
+			promise: new Promise<void>((r) => { resolve = r; }),
+			resolve,
+			drained: new Promise<void>((r) => { resolveDrained = r; }),
+			resolveDrained,
+		};
+	}
+
+	private releaseAdmission(userId: string): void {
+		this.activeAdmissions--;
+		const remainingForUser = (this.activeAdmissionsByUser.get(userId) ?? 1) - 1;
+		if (remainingForUser <= 0) {
+			this.activeAdmissionsByUser.delete(userId);
+			this.userClosures.get(userId)?.resolveDrained();
+		} else {
+			this.activeAdmissionsByUser.set(userId, remainingForUser);
+		}
+		if (this.activeAdmissions <= 0) this.globalClosure?.resolveDrained();
+	}
+
+	private async acquireAdmission(userId: string): Promise<{ release: () => void; globalEpoch: number; userEpoch: number }> {
+		const normalized = String(userId);
+		for (;;) {
+			const globalFence = this.globalClosure;
+			const userFence = this.userClosures.get(normalized);
+			if (globalFence) await globalFence.promise;
+			if (userFence) await userFence.promise;
+
+			this.activeAdmissions++;
+			this.activeAdmissionsByUser.set(normalized, (this.activeAdmissionsByUser.get(normalized) ?? 0) + 1);
+			if (!this.globalClosure && !this.userClosures.has(normalized)) {
+				let released = false;
+				const release = (): void => {
+					if (released) return;
+					released = true;
+					this.releaseAdmission(normalized);
+				};
+				return {
+					release,
+					globalEpoch: this.lifecycleEpoch,
+					userEpoch: this.lifecycleEpochByUser.get(normalized) ?? 0,
+				};
+			}
+			this.releaseAdmission(normalized);
+		}
+	}
+
+	async beginUserClosure(userId: string): Promise<() => void> {
+		const normalized = String(userId);
+		let state = this.userClosures.get(normalized);
+		if (!state) {
+			this.lifecycleEpochByUser.set(normalized, (this.lifecycleEpochByUser.get(normalized) ?? 0) + 1);
+			state = this.createClosureState();
+			this.userClosures.set(normalized, state);
+			if ((this.activeAdmissionsByUser.get(normalized) ?? 0) === 0) state.resolveDrained();
+		}
+		state.pending++;
+		await state.drained;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			const current = this.userClosures.get(normalized);
+			if (!current) return;
+			current.pending--;
+			if (current.pending <= 0) {
+				this.userClosures.delete(normalized);
+				current.resolve();
+			}
+		};
+	}
+
+	async beginGlobalClosure(): Promise<() => void> {
+		let state = this.globalClosure;
+		if (!state) {
+			this.lifecycleEpoch++;
+			state = this.createClosureState();
+			this.globalClosure = state;
+			if (this.activeAdmissions === 0) state.resolveDrained();
+		}
+		state.pending++;
+		await state.drained;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			const current = this.globalClosure;
+			if (!current) return;
+			current.pending--;
+			if (current.pending <= 0) {
+				this.globalClosure = null;
+				current.resolve();
+			}
+		};
+	}
 
 	onEvict(callback: (userId: string) => void): void {
 		this.onEvictCallbacks.push(callback);
@@ -562,6 +668,31 @@ export class ContextPool {
 	}
 
 	async ensureContext(
+		profileKey: string,
+		userId: string,
+		options?: BrowserContextOptions,
+		resolvedProxy?: ResolvedProxyConfig | null,
+		staged = false,
+		stagedGeneration?: string,
+	): Promise<PoolEntry> {
+		const admission = await this.acquireAdmission(userId);
+		try {
+			const entry = await this.ensureContextAdmitted(profileKey, userId, options, resolvedProxy, staged, stagedGeneration);
+			const normalized = String(userId);
+			if (
+				admission.globalEpoch !== this.lifecycleEpoch ||
+				admission.userEpoch !== (this.lifecycleEpochByUser.get(normalized) ?? 0)
+			) {
+				await this.closeContextIfMatches(profileKey, entry.generation).catch(() => {});
+				throw new Error('Context admission superseded by session closure');
+			}
+			return entry;
+		} finally {
+			admission.release();
+		}
+	}
+
+	private async ensureContextAdmitted(
 		profileKey: string,
 		userId: string,
 		options?: BrowserContextOptions,
